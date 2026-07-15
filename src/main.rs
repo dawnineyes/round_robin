@@ -13,8 +13,9 @@ const BACKEND_COUNT: usize = 9;
 
 // 生产级硬防护参数
 const MAX_CONNECTIONS: usize = 5000;       
-const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10); // 仅限握手超时
-const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);   
+const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10); // 仅限握手与后端连接建立超时
+const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);   
 
 struct BackendManager {
     counter: AtomicUsize,
@@ -31,9 +32,7 @@ impl BackendManager {
     }
 
     fn select_backend(&self) -> Option<u16> {
-        let idx = self.counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-            Some(x.wrapping_add(1))
-        }).unwrap_or(0);
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed);
 
         for i in 0..BACKEND_COUNT {
             let target_idx = (idx.wrapping_add(i)) % BACKEND_COUNT;
@@ -65,19 +64,18 @@ async fn main() -> io::Result<()> {
             tokio::time::sleep(Duration::from_secs(5)).await;
             for i in 0..BACKEND_COUNT {
                 let port = BACKEND_BASE + i as u16;
-                let manager_clone = manager_hc.clone();
-                
+
                 let is_alive = match tokio::time::timeout(
-                    Duration::from_millis(1500),
+                    HEALTH_CHECK_TIMEOUT,
                     check_backend_socks5_handshake(port)
                 ).await {
                     Ok(Ok(_)) => true,
                     _ => false,
                 };
-                
-                let current_state = manager_clone.health_status[i].load(Ordering::Acquire);
+
+                let current_state = manager_hc.health_status[i].load(Ordering::Acquire);
                 if current_state != is_alive {
-                    manager_clone.set_health(port, is_alive);
+                    manager_hc.set_health(port, is_alive);
                 }
             }
         }
@@ -87,6 +85,7 @@ async fn main() -> io::Result<()> {
     while let Ok((stream, client_addr)) = listener.accept().await {
         let _ = stream.set_nodelay(true);
 
+        // 限制最大并发数
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => continue,
@@ -94,12 +93,12 @@ async fn main() -> io::Result<()> {
 
         let manager_clone = manager.clone();
         tokio::spawn(async move {
-            // 【重要优化】：这里不再对整个生命周期加 timeout，只处理内部结果
             if let Err(e) = handle_socks5_client(stream, manager_clone).await {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     eprintln!("ERROR client={} error={} action=disconnect", client_addr, e);
                 }
             }
+            // 确保只有当 handle_socks5_client 彻底退出（包括数据传输完毕）后，才释放信号量
             drop(permit);
         });
     }
@@ -116,14 +115,14 @@ async fn check_backend_socks5_handshake(port: u16) -> io::Result<()> {
     if resp[0] != 0x05 || resp[1] != 0x00 {
         return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "SOCKS5 握手失败"));
     }
-    stream.shutdown().await?;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
 async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager>) -> io::Result<()> {
-    // 【重要优化】：使用 timeout 包裹整个“握手与后端连接”阶段，防止卡死
-    tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, async {
-        // --- SOCKS5 认证协商 ---
+    // --- 阶段 1：握手与建立后端连接（受限时保护，防止慢速连接攻击和挂死） ---
+    let backend = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, async {
+        // 1.1 SOCKS5 认证协商
         let mut header = [0u8; 2];
         client.read_exact(&mut header).await?;
         if header[0] != 0x05 {
@@ -131,6 +130,9 @@ async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager
         }
         
         let nmethods = header[1] as usize;
+        if nmethods > 16 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "nmethods 过大"));
+        }
         let mut methods = vec![0u8; nmethods];
         client.read_exact(&mut methods).await?;
 
@@ -140,25 +142,21 @@ async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager
         }
         client.write_all(&[0x05, 0x00]).await?;
 
-        // --- 读取并解析 SOCKS5 CONNECT 请求 ---
+        // 1.2 读取并解析 SOCKS5 CONNECT 请求
         let mut req_header = [0u8; 4];
         client.read_exact(&mut req_header).await?;
         if req_header[0] != 0x05 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "损坏的 SOCKS5 请求包"));
         }
         if req_header[1] != 0x01 { 
-            client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
             return Err(io::Error::new(io::ErrorKind::Unsupported, "仅支持 CONNECT 命令"));
         }
 
         let atyp = req_header[3];
         let bnd_addr_payload = read_socks5_address_payload(&mut client, atyp).await?;
 
-        let mut connect_payload = Vec::with_capacity(4 + bnd_addr_payload.len());
-        connect_payload.extend_from_slice(&req_header);
-        connect_payload.extend_from_slice(&bnd_addr_payload);
-
-        // --- 路由与高可用容错机制 ---
+        // 1.3 路由与高可用容错机制
         let mut retry_count = 0;
         let mut backend_stream = None;
 
@@ -191,6 +189,7 @@ async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager
         };
         let _ = backend.set_nodelay(true);
 
+        // 1.4 与后端握手并发送 CONNECT 请求
         backend.write_all(&[0x05, 0x01, 0x00]).await?;
         let mut backend_auth_resp = [0u8; 2];
         backend.read_exact(&mut backend_auth_resp).await?;
@@ -199,7 +198,8 @@ async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "后端代理拒绝无认证"));
         }
 
-        backend.write_all(&connect_payload).await?;
+        backend.write_all(&req_header).await?;
+        backend.write_all(&bnd_addr_payload).await?;
 
         let mut backend_conn_resp = [0u8; 4];
         backend.read_exact(&mut backend_conn_resp).await?;
@@ -213,27 +213,29 @@ async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("后端连接目标失败码: {}", backend_conn_resp[1])));
         }
 
-        // --- 【核心修改】：解耦传输逻辑，脱离握手超时范围 ---
-        let (mut client_reader, mut client_writer) = client.into_split();
-        let (mut backend_reader, mut backend_writer) = backend.into_split();
-
-        // 独立生成两个传输任务，使用高效的转发通道
-        let client_to_backend = tokio::spawn(async move {
-            let _ = io::copy(&mut client_reader, &mut backend_writer).await;
-            let _ = backend_writer.shutdown().await;
-        });
-
-        let backend_to_client = tokio::spawn(async move {
-            let _ = io::copy(&mut backend_reader, &mut client_writer).await;
-            let _ = client_writer.shutdown().await;
-        });
-
-        // 等待两条通道传输彻底结束，哪怕单向关闭也不强杀
-        let _ = tokio::join!(client_to_backend, backend_to_client);
-        
-        Ok::<(), io::Error>(())
+        Ok::<TcpStream, io::Error>(backend)
     }).await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 握手或后端建立连接超时"))?
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 握手或后端建立连接超时"))??;
+
+    // --- 阶段 2：双向透明传输（解耦，不限时，支持长连接） ---
+    let (mut client_reader, mut client_writer) = client.into_split();
+    let (mut backend_reader, mut backend_writer) = backend.into_split();
+
+    // 直接在当前协程运行，无需 tokio::spawn 产生额外调度，确保生命周期与信号量精准挂钩
+    let client_to_backend = async {
+        let _ = io::copy(&mut client_reader, &mut backend_writer).await;
+        let _ = backend_writer.shutdown().await;
+    };
+
+    let backend_to_client = async {
+        let _ = io::copy(&mut backend_reader, &mut client_writer).await;
+        let _ = client_writer.shutdown().await;
+    };
+
+    // 等待双向传输都结束
+    tokio::join!(client_to_backend, backend_to_client);
+    
+    Ok(())
 }
 
 async fn read_socks5_address_payload(stream: &mut TcpStream, atyp: u8) -> io::Result<Vec<u8>> {
