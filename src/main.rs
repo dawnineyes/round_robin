@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
         }
         _ => (String::new(), 0),
     };
-    tracing::info!(version = "1.3", mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
+    tracing::info!(version = "1.4", mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
 
     match cfg.mode.as_str() {
         "splitter" => {

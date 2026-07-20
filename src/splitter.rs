@@ -512,13 +512,19 @@ async fn handle_tcp_client(
 
     pool.send(Frame::fin(conn_id, seq));
     conns.remove(&conn_id);
-    let _ = writer_task.await;
+    // Snapshot stats before dropping vconn (last Arc → drops to_client_tx → writer_task exits)
     let duration_ms = vconn.created_at.elapsed().as_millis() as u64;
+    let bs = vconn.bytes_sent.load(Ordering::Relaxed);
+    let br = vconn.bytes_recv.load(Ordering::Relaxed);
+    let fs = vconn.frames_sent.load(Ordering::Relaxed);
+    let fr = vconn.frames_recv.load(Ordering::Relaxed);
+    drop(vconn);
+    let _ = writer_task.await;
     info!(conn_id,
-        bytes_sent = vconn.bytes_sent.load(Ordering::Relaxed),
-        bytes_recv = vconn.bytes_recv.load(Ordering::Relaxed),
-        frames_sent = vconn.frames_sent.load(Ordering::Relaxed),
-        frames_recv = vconn.frames_recv.load(Ordering::Relaxed),
+        bytes_sent = bs,
+        bytes_recv = br,
+        frames_sent = fs,
+        frames_recv = fr,
         duration_ms,
         "closed");
     Ok(())
