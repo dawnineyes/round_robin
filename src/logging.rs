@@ -109,7 +109,19 @@ pub fn purge_old_logs(dir: &Path, prefix: &str, keep_days: u64) {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with(prefix) || !name.ends_with(".log") {
+        // Strict match: {prefix}.YYYY-MM-DD.log
+        let date_part = name
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_suffix(".log"))
+            .unwrap_or("");
+        if date_part.len() != 11 || !date_part.starts_with('.') {
+            continue;
+        }
+        let date = &date_part[1..];
+        if date.len() != 10
+            || date.as_bytes().get(4) != Some(&b'-')
+            || date.as_bytes().get(7) != Some(&b'-')
+        {
             continue;
         }
         if let Ok(meta) = entry.metadata() {

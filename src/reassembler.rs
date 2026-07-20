@@ -186,18 +186,10 @@ impl ReorderBuf {
             }
         }
 
-        // Gap timeout: skip the gap, deliver pending data to unblock
+        // Gap timeout: skip the gap, signal RST — don't deliver dirty data
         if let Some(start) = self.gap_since {
             if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
-                let keys: Vec<u64> = self.pending.keys().cloned().collect();
-                if let Some(&max_seq) = keys.last() {
-                    for k in keys {
-                        if let Some(chunk) = self.pending.remove(&k) {
-                            out.push(chunk);
-                        }
-                    }
-                    self.expected = max_seq.wrapping_add(1);
-                }
+                self.pending.clear();
                 self.gap_since = None;
                 gap_timeout = true;
             }

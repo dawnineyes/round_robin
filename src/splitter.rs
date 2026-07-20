@@ -171,18 +171,10 @@ impl ReorderBuf {
             }
         }
 
-        // Gap timeout: skip the gap, deliver pending data to unblock
+        // Gap timeout: skip the gap, signal RST — don't deliver dirty data
         if let Some(start) = self.gap_since {
             if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
-                let keys: Vec<u64> = self.pending.keys().cloned().collect();
-                if let Some(&max_seq) = keys.last() {
-                    for k in keys {
-                        if let Some(chunk) = self.pending.remove(&k) {
-                            out.push(chunk);
-                        }
-                    }
-                    self.expected = max_seq.wrapping_add(1);
-                }
+                self.pending.clear();
                 self.gap_since = None;
                 gap_timeout = true;
             }
@@ -483,8 +475,8 @@ async fn handle_client(
         socks5::Socks5Result::Connect(accepted) => {
             handle_tcp_client(conn_id, accepted, peer, pool, conns, chunk_size).await
         }
-        socks5::Socks5Result::UdpAssociate { stream: _keepalive, relay } => {
-            handle_udp_client(pool, conns, relay, udp_sent.clone(), udp_recv.clone()).await
+        socks5::Socks5Result::UdpAssociate { stream: keepalive, relay } => {
+            handle_udp_client(pool, conns, relay, keepalive, udp_sent.clone(), udp_recv.clone()).await
         }
     }
 }
@@ -626,6 +618,7 @@ async fn handle_udp_client(
     pool: &TunnelPool,
     conns: &ConnMap,
     relay: UdpSocket,
+    keepalive: TcpStream,
     udp_sent: Arc<AtomicU64>,
     udp_recv: Arc<AtomicU64>,
 ) -> Result<()> {
@@ -648,28 +641,54 @@ async fn handle_udp_client(
     });
     conns.insert(UDP_CONN_ID, vconn);
 
+    // Track SOCKS5 client address so we can send_to (socket is unconnected).
+    let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
     let relay2 = relay.clone();
+    let ca = client_addr.clone();
     let recv_ctr = udp_recv.clone();
     tokio::spawn(async move {
         while let Some(dgram) = to_udp_rx.recv().await {
             recv_ctr.fetch_add(1, Ordering::Relaxed);
-            if relay2.send(&dgram).await.is_err() {
-                break;
+            let addr = ca.lock().unwrap().clone();
+            if let Some(addr) = addr {
+                if relay2.send_to(&dgram, addr).await.is_err() {
+                    break;
+                }
             }
         }
+    });
+
+    // RFC 1928: UDP association is tied to the TCP control connection.
+    // When the client closes it, tear down the relay.
+    let (ka_tx, mut ka_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut ka = keepalive;
+        let mut buf = [0u8; 1];
+        let _ = ka.read(&mut buf).await;
+        let _ = ka_tx.send(());
     });
 
     let mut buf = vec![0u8; 65535];
     let mut seq: u64 = 1;
     loop {
-        let (n, _client) = relay.recv_from(&mut buf).await?;
-        udp_sent.fetch_add(1, Ordering::Relaxed);
-        let frame = Frame::data(UDP_CONN_ID, seq, Bytes::copy_from_slice(&buf[..n]));
-        if !pool.send(frame) {
-            warn!("UDP relay: no live tunnels");
-            break;
+        tokio::select! {
+            result = relay.recv_from(&mut buf) => {
+                let (n, client) = result?;
+                *client_addr.lock().unwrap() = Some(client);
+                udp_sent.fetch_add(1, Ordering::Relaxed);
+                let frame = Frame::data(UDP_CONN_ID, seq, Bytes::copy_from_slice(&buf[..n]));
+                if !pool.send(frame) {
+                    warn!("UDP relay: no live tunnels");
+                    break;
+                }
+                seq += 1;
+            }
+            _ = &mut ka_rx => {
+                info!("UDP keepalive closed, ending relay");
+                break;
+            }
         }
-        seq += 1;
     }
     conns.remove(&UDP_CONN_ID);
     Ok(())
