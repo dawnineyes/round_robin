@@ -2,6 +2,7 @@
 # 复制为 config.toml，放 round_robin.exe 同目录，直接运行即可
 
 mode = "splitter"
+log = true                        # 日滚动日志，默认 true；false 关闭文件日志
 
 [splitter]
 listen = "127.0.0.1:52030"

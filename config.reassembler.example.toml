@@ -2,8 +2,10 @@
 # 复制为 config.toml，放 round_robin 同目录，直接运行即可
 
 mode = "reassembler"
+log = true
 
 [reassembler]
 listen = "127.0.0.1"          # 监听地址，默认 127.0.0.1；需要外部访问改 0.0.0.0
 ports = "52036-52039"          # 端口范围 或数组 [52031, 52032, ...]
 local_target = "127.0.0.1:52035"  # 重组后出站目标（sing-box SOCKS5 入站）
+chunk_size = 16384

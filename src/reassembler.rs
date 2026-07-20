@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -37,6 +38,10 @@ struct TunnelLink {
     alive: AtomicBool,
     strikes: AtomicU32,
     skip_rounds: AtomicU32,
+    bytes_sent: AtomicU64,
+    bytes_recv: AtomicU64,
+    frames_sent: AtomicU64,
+    frames_recv: AtomicU64,
 }
 
 struct TunnelPool {
@@ -81,7 +86,7 @@ impl TunnelPool {
                     if s >= STRIKE_THRESHOLD {
                         link.strikes.store(0, Ordering::Release);
                         link.skip_rounds.store(COOLDOWN_ROUNDS, Ordering::Release);
-                        warn!("tunnel {idx}: degraded, cooldown {COOLDOWN_ROUNDS} rounds");
+                        warn!(tunnel = idx, cooldown = COOLDOWN_ROUNDS, "degraded");
                     }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -109,7 +114,7 @@ impl TunnelPool {
                             if s >= STRIKE_THRESHOLD {
                                 link.strikes.store(0, Ordering::Release);
                                 link.skip_rounds.store(COOLDOWN_ROUNDS, Ordering::Release);
-                                warn!("tunnel {src_link}: degraded, cooldown");
+                                warn!(tunnel = src_link, "degraded, cooldown");
                             }
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -175,10 +180,13 @@ impl EgressConn {
 struct VirtConnDe {
     egress: EgressConn,
     reorder: Mutex<ReorderBuf>,
-    /// Cumulative bytes delivered in-order to egress (for ACK).
     delivered_bytes: AtomicU64,
-    /// Last delivered_bytes value we sent an ACK for.
     last_acked: AtomicU64,
+    created_at: Instant,
+    bytes_sent: AtomicU64,
+    bytes_recv: AtomicU64,
+    frames_sent: AtomicU64,
+    frames_recv: AtomicU64,
 }
 
 type ConnMap = Arc<DashMap<u32, Arc<VirtConnDe>>>;
@@ -194,7 +202,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
 
     // Global UDP socket for relay (responses from targets come back here)
     let udp_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-    info!("reassembler: UDP relay on {}", udp_sock.local_addr()?);
+    info!(addr = %udp_sock.local_addr()?, "UDP relay ready");
 
     // Background: read UDP responses from targets → DATA frames → pool
     {
@@ -215,7 +223,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                         pool.send(frame);
                     }
                     Err(e) => {
-                        warn!("UDP relay recv error: {e}");
+                        warn!(error = %e, "UDP relay recv error");
                     }
                 }
             }
@@ -232,16 +240,40 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let udp = udp_sock.clone();
         tokio::spawn(async move {
             if let Err(e) = run_tunnel_listener(listen_ip, port, local_target, conns, pending, pool, cfg.chunk_size, udp).await {
-                error!("listener on port {port} died: {e}");
+                error!(port, error = %e, "listener died");
             }
         });
     }
 
-    info!("reassembler: listening on ports {:?}, egress → {}", cfg.listen_ports, cfg.local_target);
+    info!(ports = ?cfg.listen_ports, egress = %cfg.local_target, "reassembler ready");
+
+    // Periodic heartbeat
+    let start_time = Instant::now();
+    let hb_pool = pool.clone();
+    let hb_conns = conns.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let links = hb_pool.links.lock().unwrap();
+            let total = links.len();
+            let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
+            let degraded = links.iter().filter(|l| l.skip_rounds.load(Ordering::Acquire) > 0).count();
+            drop(links);
+            let uptime = start_time.elapsed().as_secs();
+            info!(
+                uptime,
+                alive,
+                total,
+                degraded,
+                active_conns = hb_conns.len(),
+                "heartbeat"
+            );
+        }
+    });
 
     // Keep alive
     tokio::signal::ctrl_c().await?;
-    info!("reassembler: shutting down");
+    info!("shutting down");
     Ok(())
 }
 
@@ -256,7 +288,7 @@ async fn run_tunnel_listener(
     udp_sock: Arc<UdpSocket>,
 ) -> Result<()> {
     let listener = TcpListener::bind((listen_ip, port)).await?;
-    info!("reassembler: tunnel listener on {listen_ip}:{port}");
+    info!(listen = %listen_ip, port, "tunnel listener ready");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -267,12 +299,12 @@ async fn run_tunnel_listener(
         let stream = match socks5::socks5_accept_tunnel(stream).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("tunnel SOCKS5 handshake failed from {peer}: {e}");
+                warn!(peer = %peer, error = %e, "SOCKS5 handshake failed");
                 continue;
             }
         };
 
-        info!("tunnel link from {peer} on port {port} (pool size {})", pool.links.lock().unwrap().len() + 1);
+        info!(peer = %peer, port, pool_size = pool.links.lock().unwrap().len() + 1, "tunnel link accepted");
 
         let (rd, wr) = stream.into_split();
         let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHAN_CAP);
@@ -281,31 +313,49 @@ async fn run_tunnel_listener(
             alive: AtomicBool::new(true),
             strikes: AtomicU32::new(0),
             skip_rounds: AtomicU32::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
         });
         pool.add(link.clone());
 
         // Writer task
-        tokio::spawn(drain_frames(rx, wr));
+        tokio::spawn(drain_frames(rx, wr, link.clone()));
 
         // Reader task (one per link)
         let conns = conns.clone();
         let pending = pending.clone();
         let pool = pool.clone();
         let udp = udp_sock.clone();
+        let link2 = link.clone();
         tokio::spawn(async move {
-            if let Err(e) = tunnel_read_loop(rd, conns, pending, pool, local_target, port as usize, chunk_size, udp).await {
-                warn!("tunnel link from {peer}: {e}");
+            if let Err(e) = tunnel_read_loop(rd, conns, pending, pool, local_target, port as usize, chunk_size, udp, &link2).await {
+                warn!(tunnel = port, error = %e, "read loop ended");
             }
-            link.alive.store(false, Ordering::Release);
+            link2.alive.store(false, Ordering::Release);
+            info!(tunnel = port,
+                bytes_sent = link2.bytes_sent.load(Ordering::Relaxed),
+                bytes_recv = link2.bytes_recv.load(Ordering::Relaxed),
+                frames_sent = link2.frames_sent.load(Ordering::Relaxed),
+                frames_recv = link2.frames_recv.load(Ordering::Relaxed),
+                "disconnected");
         });
     }
 }
 
-async fn drain_frames(mut rx: mpsc::Receiver<Frame>, mut wr: tokio::net::tcp::OwnedWriteHalf) {
+async fn drain_frames(
+    mut rx: mpsc::Receiver<Frame>,
+    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    link: Arc<TunnelLink>,
+) {
     while let Some(frame) = rx.recv().await {
+        let n = frame.payload.len() as u64;
         if wr.write_all(&frame.encode()).await.is_err() {
             break;
         }
+        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        link.frames_sent.fetch_add(1, Ordering::Relaxed);
     }
     let _ = wr.shutdown().await;
 }
@@ -319,6 +369,7 @@ async fn tunnel_read_loop(
     src_port: usize,
     chunk_size: usize,
     udp_sock: Arc<UdpSocket>,
+    link: &TunnelLink,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
@@ -326,7 +377,10 @@ async fn tunnel_read_loop(
             Some(f) => f,
             None => return Ok(()),
         };
+        let plen = frame.payload.len() as u64;
         handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size, &udp_sock).await?;
+        link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
+        link.frames_recv.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -357,7 +411,7 @@ async fn handle_frame(
 
         // Parse target from SYN payload
         let syn_target = SynTarget::decode(&frame.payload)?;
-        info!("conn {cid}: SYN → {} (proto={})", syn_target.address, syn_target.proto);
+        info!(conn_id = cid, target = %syn_target.address, proto = syn_target.proto, "SYN");
 
         // Connect to local_target via SOCKS5
         let egress_stream = match socks5::socks5_client_connect(
@@ -369,7 +423,7 @@ async fn handle_frame(
         {
             Ok(s) => s,
             Err(e) => {
-                warn!("conn {cid}: failed to connect egress to {local_target} for {}: {e}", syn_target.address);
+                warn!(conn_id = cid, target = %syn_target.address, error = %e, "egress connect failed");
                 pending.remove(&cid);
                 pool.send_via(Frame::rst(cid), src_port);
                 return Ok(());
@@ -385,6 +439,11 @@ async fn handle_frame(
             reorder: Mutex::new(ReorderBuf::new()),
             delivered_bytes: AtomicU64::new(0),
             last_acked: AtomicU64::new(0),
+            created_at: Instant::now(),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
         });
 
         // Spawn egress writer: ordered data → egress connection
@@ -406,12 +465,12 @@ async fn handle_frame(
                     for chunk in ready {
                         drained += chunk.len() as u64;
                         if !vconn.egress.write(&chunk) {
-                            warn!("conn {cid}: egress write failed (drain)");
+                            warn!(conn_id = cid, "egress write failed (drain)");
                             break;
                         }
                     }
                 } else if f.flags & FLAG_FIN != 0 {
-                    info!("conn {cid}: FIN during SYN, cleaning up");
+                    info!(conn_id = cid, "FIN during SYN, cleaning up");
                     conns.remove(&cid);
                 }
             }
@@ -430,15 +489,18 @@ async fn handle_frame(
     // DATA
     if frame.flags & FLAG_DATA != 0 {
         if let Some(vconn) = conns.get(&cid) {
+            let plen = frame.payload.len() as u64;
             let ready = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
             let mut delivered: u64 = 0;
             for chunk in ready {
                 delivered += chunk.len() as u64;
                 if !vconn.egress.write(&chunk) {
-                    warn!("conn {cid}: egress write failed");
+                    warn!(conn_id = cid, "egress write failed");
                     break;
                 }
             }
+            vconn.bytes_recv.fetch_add(plen, Ordering::Relaxed);
+            vconn.frames_recv.fetch_add(1, Ordering::Relaxed);
             if delivered > 0 {
                 send_ack_if_needed(cid, &vconn, delivered, pool);
             }
@@ -451,8 +513,15 @@ async fn handle_frame(
     // FIN
     if frame.flags & FLAG_FIN != 0 {
         if let Some((_, vconn)) = conns.remove(&cid) {
-            info!("conn {cid}: FIN received, cleaning up");
-            drop(vconn); // drops write_tx → egress write task exits → egress wr shutdown
+            let dur = vconn.created_at.elapsed().as_millis() as u64;
+            info!(conn_id = cid,
+                bytes_sent = vconn.bytes_sent.load(Ordering::Relaxed),
+                bytes_recv = vconn.bytes_recv.load(Ordering::Relaxed),
+                frames_sent = vconn.frames_sent.load(Ordering::Relaxed),
+                frames_recv = vconn.frames_recv.load(Ordering::Relaxed),
+                duration_ms = dur,
+                "FIN, closed");
+            drop(vconn);
         }
         return Ok(());
     }
@@ -460,7 +529,7 @@ async fn handle_frame(
     // RST
     if frame.flags & FLAG_RST != 0 {
         if let Some((_, vconn)) = conns.remove(&cid) {
-            info!("conn {cid}: RST received, force close");
+            info!(conn_id = cid, "RST, force close");
             drop(vconn);
         }
         return Ok(());
@@ -523,23 +592,35 @@ async fn read_from_egress(
     let mut seq: u64 = 1;
     loop {
         match rd.read(&mut buf).await {
-            Ok(0) => break, // egress EOF
+            Ok(0) => break,
             Ok(n) => {
                 let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
                 if !pool.send(frame) {
-                    warn!("conn {conn_id}: no live tunnels for egress response");
+                    warn!(conn_id, "no live tunnels for egress response");
                     break;
+                }
+                // Count on the VirtConnDe
+                if let Some(vconn) = conns.get(&conn_id) {
+                    vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                    vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
                 }
                 seq += 1;
             }
             Err(e) => {
-                warn!("conn {conn_id}: egress read error: {e}");
+                warn!(conn_id, error = %e, "egress read error");
                 break;
             }
         }
     }
-    // Send FIN + cleanup
     pool.send(Frame::fin(conn_id, seq));
-    conns.remove(&conn_id);
-    info!("conn {conn_id}: egress closed");
+    if let Some((_, vconn)) = conns.remove(&conn_id) {
+        let dur = vconn.created_at.elapsed().as_millis() as u64;
+        info!(conn_id,
+            bytes_sent = vconn.bytes_sent.load(Ordering::Relaxed),
+            bytes_recv = vconn.bytes_recv.load(Ordering::Relaxed),
+            frames_sent = vconn.frames_sent.load(Ordering::Relaxed),
+            frames_recv = vconn.frames_recv.load(Ordering::Relaxed),
+            duration_ms = dur,
+            "closed");
+    }
 }

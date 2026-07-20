@@ -18,10 +18,18 @@ struct Config {
     /// "splitter" or "reassembler"
     mode: String,
 
+    /// Enable daily rolling file logging (default true).
+    #[serde(default = "default_true")]
+    log: bool,
+
     #[serde(default)]
     splitter: Option<SplitterConfig>,
     #[serde(default)]
     reassembler: Option<ReassemblerConfig>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -151,27 +159,45 @@ fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Daily rolling log to exe directory: round_robin.2026-07-21.log, etc.
-    let log_dir = exe_dir().unwrap_or_else(|| PathBuf::from("."));
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, log_dir, "round_robin");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .init();
-    // _guard lives until main() exits, flushes remaining logs on drop
-
     let content = find_config()?;
     let cfg: Config = toml::from_str(&content)?;
 
-    // Background: purge log files older than 7 days, check once per day
+    // Conditional file logging
     let log_dir = exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    let _guard: Option<Box<dyn std::any::Any + Send>> = if cfg.log {
+        let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, "round_robin");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .init();
+        Some(Box::new(guard))
+    } else {
+        None
+    };
+    // _guard lives until main() exits, flushes remaining logs on drop
+
+    // Background: purge log files older than 7 days, check once per day
     tokio::spawn(async move {
         loop {
             purge_old_logs(&log_dir, 7);
             tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         }
     });
+
+    // Startup banner (goes to log file if logging enabled, otherwise discarded)
+    let (listen, tunnels) = match cfg.mode.as_str() {
+        "splitter" => {
+            let sc = cfg.splitter.as_ref();
+            (sc.map(|s| s.listen.to_string()).unwrap_or_default(), sc.map(|s| s.tunnel.len()).unwrap_or(0))
+        }
+        "reassembler" => {
+            let rc = cfg.reassembler.as_ref();
+            (rc.map(|r| r.local_target.to_string()).unwrap_or_default(),
+             rc.map(|r| parse_ports(&r.ports).map(|v| v.len()).unwrap_or(0)).unwrap_or(0))
+        }
+        _ => (String::new(), 0),
+    };
+    tracing::info!(version = "1.3", mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
 
     match cfg.mode.as_str() {
         "splitter" => {
