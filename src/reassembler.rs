@@ -228,8 +228,19 @@ struct VirtConnDe {
 }
 
 type ConnMap = Arc<DashMap<u32, Arc<VirtConnDe>>>;
+
 /// Frames that arrived before the SYN handler finished creating the VirtConnDe.
-type PendingMap = Arc<DashMap<u32, Vec<Frame>>>;
+struct PendingEntry {
+    frames: Vec<Frame>,
+    since: Instant,
+}
+
+/// Max frames buffered per CID before the SYN handshake completes.
+const MAX_PENDING_FRAMES_PER_CID: usize = 256;
+/// Drop stale pending entries that never received a SYN.
+const PENDING_TTL_SECS: u64 = 30;
+
+type PendingMap = Arc<DashMap<u32, PendingEntry>>;
 
 // ── Main entry ────────────────────────────────────────────────────────
 
@@ -248,6 +259,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            let mut udp_seq: u64 = 1;
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, src)) => {
@@ -257,7 +269,8 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                             port: src.port(),
                         };
                         let dgram = socks5::encode_udp_datagram(&src_target, &buf[..n]);
-                        let frame = Frame::data(UDP_CONN_ID, 1, dgram);
+                        let frame = Frame::data(UDP_CONN_ID, udp_seq, dgram);
+                        udp_seq = udp_seq.wrapping_add(1);
                         pool.send(frame);
                     }
                     Err(e) => {
@@ -289,6 +302,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let start_time = Instant::now();
     let hb_pool = pool.clone();
     let hb_conns = conns.clone();
+    let hb_pending = pending.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -299,6 +313,8 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             drop(links);
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
+            // Sweep stale pending entries that never got a SYN
+            hb_pending.retain(|_, entry| entry.since.elapsed().as_secs() < PENDING_TTL_SECS);
             let uptime = start_time.elapsed().as_secs();
             info!(
                 uptime,
@@ -479,7 +495,10 @@ async fn handle_frame(
         // Reserve a pending slot so DATA/FIN arriving during SOCKS5 connect
         // are queued instead of dropped.  Use entry API so we don't
         // overwrite DATA frames that already arrived before the SYN.
-        pending.entry(cid).or_insert_with(Vec::new);
+        pending.entry(cid).or_insert_with(|| PendingEntry {
+            frames: Vec::new(),
+            since: Instant::now(),
+        });
 
         // Parse target from SYN payload
         let syn_target = SynTarget::decode(&frame.payload)?;
@@ -529,9 +548,9 @@ async fn handle_frame(
         conns.insert(cid, vconn.clone());
 
         // Drain any frames that arrived during SOCKS5 connect
-        if let Some((_, queued)) = pending.remove(&cid) {
+        if let Some((_, entry)) = pending.remove(&cid) {
             let mut drained: u64 = 0;
-            for f in queued {
+            for f in entry.frames {
                 if f.flags & FLAG_DATA != 0 {
                     let (ready, gap_timeout) = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
                     if gap_timeout {
@@ -593,9 +612,16 @@ async fn handle_frame(
         // Create a pending slot so data isn't lost — the SYN handler
         // will drain it once the egress connection is established.
         if let Some(mut entry) = pending.get_mut(&cid) {
-            entry.push(frame);
+            if entry.frames.len() < MAX_PENDING_FRAMES_PER_CID {
+                entry.frames.push(frame);
+            } else {
+                warn!(conn_id = cid, count = entry.frames.len(), "pending overflow, dropping DATA");
+            }
         } else if pending.len() < MAX_PENDING_CIDS {
-            pending.insert(cid, vec![frame]);
+            pending.insert(cid, PendingEntry {
+                frames: vec![frame],
+                since: Instant::now(),
+            });
         }
         return Ok(());
     }
@@ -700,6 +726,14 @@ async fn read_from_egress(
                 warn!(conn_id, error = %e, "egress read error");
                 break;
             }
+        }
+    }
+    // Send final ACK so splitter knows exact delivery count for this conn
+    if let Some(vconn) = conns.get(&conn_id) {
+        let delivered = vconn.delivered_bytes.load(Ordering::Acquire);
+        let last_acked = vconn.last_acked.load(Ordering::Acquire);
+        if delivered > last_acked {
+            let _ = pool.send(Frame::ack(conn_id, delivered, 0));
         }
     }
     pool.send(Frame::fin(conn_id, seq));
