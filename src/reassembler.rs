@@ -569,8 +569,13 @@ async fn handle_frame(
             if delivered > 0 {
                 send_ack_if_needed(cid, &vconn, delivered, pool);
             }
-        } else if let Some(mut entry) = pending.get_mut(&cid) {
+            return Ok(());
+        }
+        // Not in conns — could be pending (SYN still in flight) or stale (splitter restarted)
+        if let Some(mut entry) = pending.get_mut(&cid) {
             entry.push(frame);
+        } else {
+            pool.send(Frame::rst(cid));
         }
         return Ok(());
     }
