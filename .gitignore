@@ -1,2 +1,4 @@
 /target
 /backup
+*.exe
+config.toml

@@ -1,267 +1,209 @@
 #![windows_subsystem = "windows"]
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+mod frame;
+mod reassembler;
+mod socks5;
+mod splitter;
 
-const LISTEN: &str = "127.0.0.1:52030";
-const BACKEND_BASE: u16 = 52031;
-const BACKEND_COUNT: usize = 9;
+use anyhow::{bail, Result};
+use serde::Deserialize;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
-// 生产级硬防护参数
-const MAX_CONNECTIONS: usize = 5000;       
-const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10); // 仅限握手与后端连接建立超时
-const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);   
+// ── TOML config schema ────────────────────────────────────────────────
 
-struct BackendManager {
-    counter: AtomicUsize,
-    health_status: [AtomicBool; BACKEND_COUNT],
+#[derive(Deserialize)]
+struct Config {
+    /// "splitter" or "reassembler"
+    mode: String,
+
+    #[serde(default)]
+    splitter: Option<SplitterConfig>,
+    #[serde(default)]
+    reassembler: Option<ReassemblerConfig>,
 }
 
-impl BackendManager {
-    fn new() -> Self {
-        let health_status = std::array::from_fn(|_| AtomicBool::new(true));
-        Self {
-            counter: AtomicUsize::new(0),
-            health_status,
-        }
-    }
+#[derive(Deserialize)]
+struct SplitterConfig {
+    #[serde(default = "default_splitter_listen")]
+    listen: SocketAddr,
+    #[serde(default = "default_chunk")]
+    chunk_size: usize,
+    tunnel: Vec<Tunnel>,
+}
 
-    fn select_backend(&self) -> Option<u16> {
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed);
+#[derive(Deserialize)]
+struct ReassemblerConfig {
+    #[serde(default = "default_listen_ip")]
+    listen: std::net::IpAddr,
+    #[serde(default = "default_reassembler_ports")]
+    ports: Ports,
+    #[serde(default = "default_local_target")]
+    local_target: SocketAddr,
+    #[serde(default = "default_chunk")]
+    chunk_size: usize,
+}
 
-        for i in 0..BACKEND_COUNT {
-            let target_idx = (idx.wrapping_add(i)) % BACKEND_COUNT;
-            if self.health_status[target_idx].load(Ordering::Acquire) {
-                return Some(BACKEND_BASE + target_idx as u16);
+fn default_listen_ip() -> std::net::IpAddr {
+    "127.0.0.1".parse().unwrap()
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Ports {
+    Range(String),
+    List(Vec<u16>),
+}
+
+#[derive(Deserialize)]
+struct Tunnel {
+    proxy: SocketAddr,
+    target: String,
+    port: u16,
+}
+
+fn default_chunk() -> usize {
+    16384
+}
+
+fn default_splitter_listen() -> SocketAddr {
+    "127.0.0.1:52030".parse().unwrap()
+}
+
+fn default_reassembler_ports() -> Ports {
+    Ports::Range("52031-52039".into())
+}
+
+fn default_local_target() -> SocketAddr {
+    "127.0.0.1:52030".parse().unwrap()
+}
+
+// ── Path helpers ──────────────────────────────────────────────────────
+
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+// ── Config loading ────────────────────────────────────────────────────
+
+fn find_config() -> Result<String> {
+    for name in &["config.toml", "round_robin.toml"] {
+        if let Some(ref dir) = exe_dir() {
+            let path = dir.join(name);
+            if path.is_file() {
+                return Ok(std::fs::read_to_string(&path)?);
             }
         }
-        None
-    }
-
-    fn set_health(&self, port: u16, alive: bool) {
-        if port >= BACKEND_BASE && (port as usize) < (BACKEND_BASE as usize + BACKEND_COUNT) {
-            let idx = (port - BACKEND_BASE) as usize;
-            self.health_status[idx].store(alive, Ordering::Release);
+        if Path::new(name).is_file() {
+            return Ok(std::fs::read_to_string(name)?);
         }
     }
+    bail!("no config file found: tried config.toml, round_robin.toml")
 }
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
-    let listener = TcpListener::bind(LISTEN).await?;
-    let manager = Arc::new(BackendManager::new());
-    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+// ── Log cleanup ───────────────────────────────────────────────────────
 
-    // --- 1. SOCKS5 健康检查 ---
-    let manager_hc = manager.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            for i in 0..BACKEND_COUNT {
-                let port = BACKEND_BASE + i as u16;
+fn purge_old_logs(log_dir: &Path, keep_days: u64) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(keep_days * 86400));
+    let Some(cutoff) = cutoff else { return };
 
-                let is_alive = match tokio::time::timeout(
-                    HEALTH_CHECK_TIMEOUT,
-                    check_backend_socks5_handshake(port)
-                ).await {
-                    Ok(Ok(_)) => true,
-                    _ => false,
-                };
-
-                let current_state = manager_hc.health_status[i].load(Ordering::Acquire);
-                if current_state != is_alive {
-                    manager_hc.set_health(port, is_alive);
+    let Ok(entries) = std::fs::read_dir(log_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // Match round_robin.YYYY-MM-DD.log
+        if !name.starts_with("round_robin.") || !name.ends_with(".log") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mod_time) = meta.modified() {
+                if mod_time < cutoff {
+                    let _ = std::fs::remove_file(&path);
                 }
             }
+        }
+    }
+}
+
+fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
+    match ports {
+        Ports::List(v) => Ok(v.clone()),
+        Ports::Range(s) => {
+            if let Some((start, end)) = s.split_once('-') {
+                let start: u16 = start.trim().parse()?;
+                let end: u16 = end.trim().parse()?;
+                if start > end {
+                    bail!("port range: start > end");
+                }
+                Ok((start..=end).collect())
+            } else {
+                Ok(vec![s.trim().parse()?])
+            }
+        }
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Daily rolling log to exe directory: round_robin.2026-07-21.log, etc.
+    let log_dir = exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, log_dir, "round_robin");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .init();
+    // _guard lives until main() exits, flushes remaining logs on drop
+
+    let content = find_config()?;
+    let cfg: Config = toml::from_str(&content)?;
+
+    // Background: purge log files older than 7 days, check once per day
+    let log_dir = exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    tokio::spawn(async move {
+        loop {
+            purge_old_logs(&log_dir, 7);
+            tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
         }
     });
 
-    // --- 2. 主 Accept 循环 ---
-    while let Ok((stream, client_addr)) = listener.accept().await {
-        let _ = stream.set_nodelay(true);
-
-        // 限制最大并发数
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let manager_clone = manager.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_socks5_client(stream, manager_clone).await {
-                if e.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("ERROR client={} error={} action=disconnect", client_addr, e);
-                }
+    match cfg.mode.as_str() {
+        "splitter" => {
+            let sc = cfg.splitter.ok_or_else(|| anyhow::anyhow!("config missing [splitter] section"))?;
+            if sc.chunk_size < frame::MIN_CHUNK || sc.chunk_size > frame::MAX_CHUNK {
+                bail!("splitter.chunk_size must be {}..{}", frame::MIN_CHUNK, frame::MAX_CHUNK);
             }
-            // 确保只有当 handle_socks5_client 彻底退出（包括数据传输完毕）后，才释放信号量
-            drop(permit);
-        });
-    }
-
-    Ok(())
-}
-
-async fn check_backend_socks5_handshake(port: u16) -> io::Result<()> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    let _ = stream.set_nodelay(true);
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut resp = [0u8; 2];
-    stream.read_exact(&mut resp).await?;
-    if resp[0] != 0x05 || resp[1] != 0x00 {
-        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "SOCKS5 握手失败"));
-    }
-    let _ = stream.shutdown().await;
-    Ok(())
-}
-
-async fn handle_socks5_client(mut client: TcpStream, manager: Arc<BackendManager>) -> io::Result<()> {
-    // --- 阶段 1：握手与建立后端连接（受限时保护，防止慢速连接攻击和挂死） ---
-    let backend = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, async {
-        // 1.1 SOCKS5 认证协商
-        let mut header = [0u8; 2];
-        client.read_exact(&mut header).await?;
-        if header[0] != 0x05 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "非 SOCKS5 协议"));
-        }
-        
-        let nmethods = header[1] as usize;
-        if nmethods > 16 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "nmethods 过大"));
-        }
-        let mut methods = vec![0u8; nmethods];
-        client.read_exact(&mut methods).await?;
-
-        if !methods.contains(&0x00) {
-            client.write_all(&[0x05, 0xFF]).await?;
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "客户端不支持无认证模式"));
-        }
-        client.write_all(&[0x05, 0x00]).await?;
-
-        // 1.2 读取并解析 SOCKS5 CONNECT 请求
-        let mut req_header = [0u8; 4];
-        client.read_exact(&mut req_header).await?;
-        if req_header[0] != 0x05 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "损坏的 SOCKS5 请求包"));
-        }
-        if req_header[1] != 0x01 { 
-            let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "仅支持 CONNECT 命令"));
-        }
-
-        let atyp = req_header[3];
-        let bnd_addr_payload = read_socks5_address_payload(&mut client, atyp).await?;
-
-        // 1.3 路由与高可用容错机制
-        let mut retry_count = 0;
-        let mut backend_stream = None;
-
-        while retry_count < 2 {
-            if let Some(port) = manager.select_backend() {
-                match tokio::time::timeout(
-                    BACKEND_CONNECT_TIMEOUT,
-                    TcpStream::connect(("127.0.0.1", port))
-                ).await {
-                    Ok(Ok(stream)) => {
-                        backend_stream = Some(stream);
-                        break;
-                    }
-                    _ => {
-                        manager.set_health(port, false);
-                        retry_count += 1;
-                    }
-                }
-            } else {
-                break;
+            let tunnels: Vec<splitter::TunnelEndpoint> = sc.tunnel.iter().map(|t| {
+                splitter::TunnelEndpoint { proxy: t.proxy, target: t.target.clone(), port: t.port }
+            }).collect();
+            if tunnels.is_empty() {
+                bail!("[splitter] has no [[splitter.tunnel]] entries");
             }
+            splitter::run_splitter(splitter::SplitterConfig {
+                listen_addr: sc.listen,
+                tunnels,
+                chunk_size: sc.chunk_size,
+            }).await
         }
-
-        let mut backend = match backend_stream {
-            Some(s) => s,
-            None => {
-                let _ = client.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                return Err(io::Error::new(io::ErrorKind::NotConnected, "所有上游后端均不可用或连接超时"));
+        "reassembler" => {
+            let rc = cfg.reassembler.ok_or_else(|| anyhow::anyhow!("config missing [reassembler] section"))?;
+            if rc.chunk_size < frame::MIN_CHUNK || rc.chunk_size > frame::MAX_CHUNK {
+                bail!("reassembler.chunk_size must be {}..{}", frame::MIN_CHUNK, frame::MAX_CHUNK);
             }
-        };
-        let _ = backend.set_nodelay(true);
-
-        // 1.4 与后端握手并发送 CONNECT 请求
-        backend.write_all(&[0x05, 0x01, 0x00]).await?;
-        let mut backend_auth_resp = [0u8; 2];
-        backend.read_exact(&mut backend_auth_resp).await?;
-        if backend_auth_resp[0] != 0x05 || backend_auth_resp[1] != 0x00 {
-            let _ = client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "后端代理拒绝无认证"));
+            let ports = parse_ports(&rc.ports)?;
+            reassembler::run_reassembler(reassembler::ReassemblerConfig {
+                listen_ip: rc.listen,
+                listen_ports: ports,
+                local_target: rc.local_target,
+                chunk_size: rc.chunk_size,
+            }).await
         }
-
-        backend.write_all(&req_header).await?;
-        backend.write_all(&bnd_addr_payload).await?;
-
-        let mut backend_conn_resp = [0u8; 4];
-        backend.read_exact(&mut backend_conn_resp).await?;
-        let resp_atyp = backend_conn_resp[3];
-        let resp_addr_payload = read_socks5_address_payload(&mut backend, resp_atyp).await?;
-
-        client.write_all(&backend_conn_resp).await?;
-        client.write_all(&resp_addr_payload).await?;
-
-        if backend_conn_resp[1] != 0x00 {
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("后端连接目标失败码: {}", backend_conn_resp[1])));
-        }
-
-        Ok::<TcpStream, io::Error>(backend)
-    }).await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 握手或后端建立连接超时"))??;
-
-    // --- 阶段 2：双向透明传输（解耦，不限时，支持长连接） ---
-    let (mut client_reader, mut client_writer) = client.into_split();
-    let (mut backend_reader, mut backend_writer) = backend.into_split();
-
-    // 直接在当前协程运行，无需 tokio::spawn 产生额外调度，确保生命周期与信号量精准挂钩
-    let client_to_backend = async {
-        let _ = io::copy(&mut client_reader, &mut backend_writer).await;
-        let _ = backend_writer.shutdown().await;
-    };
-
-    let backend_to_client = async {
-        let _ = io::copy(&mut backend_reader, &mut client_writer).await;
-        let _ = client_writer.shutdown().await;
-    };
-
-    // 等待双向传输都结束
-    tokio::join!(client_to_backend, backend_to_client);
-    
-    Ok(())
-}
-
-async fn read_socks5_address_payload(stream: &mut TcpStream, atyp: u8) -> io::Result<Vec<u8>> {
-    match atyp {
-        0x01 => { 
-            let mut buf = vec![0u8; 6];
-            stream.read_exact(&mut buf).await?;
-            Ok(buf)
-        }
-        0x03 => { 
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await?;
-            let domain_len = len_buf[0] as usize;
-            if domain_len == 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "零长度的无效域名"));
-            }
-            let mut buf = vec![0u8; 1 + domain_len + 2];
-            buf[0] = len_buf[0];
-            stream.read_exact(&mut buf[1..]).await?;
-            Ok(buf)
-        }
-        0x04 => { 
-            let mut buf = vec![0u8; 18];
-            stream.read_exact(&mut buf).await?;
-            Ok(buf)
-        }
-        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "未知的 ATYP 地址类型")),
+        other => bail!("unknown mode: {other}, expected \"splitter\" or \"reassembler\""),
     }
 }

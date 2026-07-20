@@ -1,0 +1,53 @@
+# round_robin — Splitter (Windows 端)
+# 复制为 config.toml，放 round_robin.exe 同目录，直接运行即可
+
+mode = "splitter"
+
+[splitter]
+listen = "127.0.0.1:52030"
+# chunk_size = 16384           # 分片大小 (512-65535)，默认 16384
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52031"
+target = "127.0.0.1"
+port = 52031
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52032"
+target = "127.0.0.1"
+port = 52032
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52033"
+target = "127.0.0.1"
+port = 52033
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52034"
+target = "127.0.0.1"
+port = 52034
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52035"
+target = "127.0.0.1"
+port = 52035
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52036"
+target = "127.0.0.1"
+port = 52036
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52037"
+target = "127.0.0.1"
+port = 52037
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52038"
+target = "127.0.0.1"
+port = 52038
+
+[[splitter.tunnel]]
+proxy = "127.0.0.1:52039"
+target = "127.0.0.1"
+port = 52039
