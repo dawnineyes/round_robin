@@ -340,8 +340,10 @@ async fn handle_client(
 
     // Send FIN, cleanup
     pool.send(Frame::fin(conn_id, seq));
+    // Remove from map → drops VirtConn → drops to_client_tx → writer task exits
     conns.remove(&conn_id);
-    writer_task.abort();
+    // Wait for writer to drain its last chunk, then drop
+    let _ = writer_task.await;
     info!("conn {conn_id}: closed");
     Ok(())
 }

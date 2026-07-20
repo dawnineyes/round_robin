@@ -129,21 +129,25 @@ struct VirtConnDe {
 }
 
 type ConnMap = Arc<DashMap<u32, Arc<VirtConnDe>>>;
+/// Frames that arrived before the SYN handler finished creating the VirtConnDe.
+type PendingMap = Arc<DashMap<u32, Vec<Frame>>>;
 
 // ── Main entry ────────────────────────────────────────────────────────
 
 pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let conns: ConnMap = Arc::new(DashMap::new());
+    let pending: PendingMap = Arc::new(DashMap::new());
     let pool = Arc::new(TunnelPool::new());
 
     // Spawn a listener for each port
     for &port in &cfg.listen_ports {
         let conns = conns.clone();
+        let pending = pending.clone();
         let pool = pool.clone();
         let local_target = cfg.local_target;
         let listen_ip = cfg.listen_ip;
         tokio::spawn(async move {
-            if let Err(e) = run_tunnel_listener(listen_ip, port, local_target, conns, pool, cfg.chunk_size).await {
+            if let Err(e) = run_tunnel_listener(listen_ip, port, local_target, conns, pending, pool, cfg.chunk_size).await {
                 error!("listener on port {port} died: {e}");
             }
         });
@@ -162,6 +166,7 @@ async fn run_tunnel_listener(
     port: u16,
     local_target: SocketAddr,
     conns: ConnMap,
+    pending: PendingMap,
     pool: Arc<TunnelPool>,
     chunk_size: usize,
 ) -> Result<()> {
@@ -171,6 +176,17 @@ async fn run_tunnel_listener(
     loop {
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
+
+        // SOCKS5 handshake: sing-box SOCKS5 outbound CONNECTs here.
+        // Accept any no-auth client, ignore the CONNECT target.
+        let stream = match socks5::socks5_accept_tunnel(stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("tunnel SOCKS5 handshake failed from {peer}: {e}");
+                continue;
+            }
+        };
+
         info!("tunnel link from {peer} on port {port} (pool size {})", pool.links.lock().unwrap().len() + 1);
 
         let (rd, wr) = stream.into_split();
@@ -183,10 +199,10 @@ async fn run_tunnel_listener(
 
         // Reader task (one per link)
         let conns = conns.clone();
+        let pending = pending.clone();
         let pool = pool.clone();
-        let local_target = local_target;
         tokio::spawn(async move {
-            if let Err(e) = tunnel_read_loop(rd, conns.clone(), pool.clone(), local_target, port as usize, chunk_size).await {
+            if let Err(e) = tunnel_read_loop(rd, conns, pending, pool, local_target, port as usize, chunk_size).await {
                 warn!("tunnel link from {peer}: {e}");
             }
             link.alive.store(false, Ordering::Release);
@@ -206,6 +222,7 @@ async fn drain_frames(mut rx: mpsc::UnboundedReceiver<Frame>, mut wr: tokio::net
 async fn tunnel_read_loop(
     mut rd: tokio::net::tcp::OwnedReadHalf,
     conns: ConnMap,
+    pending: PendingMap,
     pool: Arc<TunnelPool>,
     local_target: SocketAddr,
     src_port: usize,
@@ -217,7 +234,7 @@ async fn tunnel_read_loop(
             Some(f) => f,
             None => return Ok(()),
         };
-        handle_frame(frame, &conns, &pool, local_target, src_port, chunk_size).await?;
+        handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size).await?;
     }
 }
 
@@ -226,6 +243,7 @@ async fn tunnel_read_loop(
 async fn handle_frame(
     frame: Frame,
     conns: &ConnMap,
+    pending: &PendingMap,
     pool: &Arc<TunnelPool>,
     local_target: SocketAddr,
     src_port: usize,
@@ -235,6 +253,10 @@ async fn handle_frame(
 
     // SYN: new virtual connection
     if frame.flags & FLAG_SYN != 0 {
+        // Reserve a pending slot so DATA/FIN arriving during SOCKS5 connect
+        // are queued instead of dropped
+        pending.insert(cid, Vec::new());
+
         // Parse target from SYN payload
         let syn_target = SynTarget::decode(&frame.payload)?;
         info!("conn {cid}: SYN → {} (proto={})", syn_target.address, syn_target.proto);
@@ -250,6 +272,7 @@ async fn handle_frame(
             Ok(s) => s,
             Err(e) => {
                 warn!("conn {cid}: failed to connect egress to {local_target} for {}: {e}", syn_target.address);
+                pending.remove(&cid);
                 pool.send_via(Frame::rst(cid), src_port);
                 return Ok(());
             }
@@ -272,7 +295,25 @@ async fn handle_frame(
         let pool_clone = Arc::clone(pool);
         tokio::spawn(read_from_egress(cid, egress_rd, conns_clone, pool_clone, chunk_size));
 
-        conns.insert(cid, vconn);
+        conns.insert(cid, vconn.clone());
+
+        // Drain any frames that arrived during SOCKS5 connect
+        if let Some((_, queued)) = pending.remove(&cid) {
+            for f in queued {
+                if f.flags & FLAG_DATA != 0 {
+                    let ready = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
+                    for chunk in ready {
+                        if !vconn.egress.write(&chunk) {
+                            warn!("conn {cid}: egress write failed (drain)");
+                            break;
+                        }
+                    }
+                } else if f.flags & FLAG_FIN != 0 {
+                    info!("conn {cid}: FIN during SYN, cleaning up");
+                    conns.remove(&cid);
+                }
+            }
+        }
 
         // Reply SYN+ACK
         let syn_ack = Frame::syn_ack(cid);
@@ -281,7 +322,6 @@ async fn handle_frame(
         return Ok(());
     }
 
-    // For DATA/FIN/RST: get or create is not needed — conn must exist
     // DATA
     if frame.flags & FLAG_DATA != 0 {
         if let Some(vconn) = conns.get(&cid) {
@@ -292,7 +332,11 @@ async fn handle_frame(
                     break;
                 }
             }
+        } else if let Some(mut entry) = pending.get_mut(&cid) {
+            // SYN is still in progress, queue this frame
+            entry.push(frame);
         }
+        // else: conn already cleaned up, drop frame
         return Ok(());
     }
 

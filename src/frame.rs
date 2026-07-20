@@ -242,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn decoder_tiny_reads() {
         // Simulate byte-by-byte reads to stress the buffer logic
-        let f = Frame::syn(7, SynTarget { proto: PROTO_TCP, address: "example.com:443".into(), port: 443 }.encode());
+        let f = Frame::syn(7, SynTarget { proto: PROTO_TCP, address: "example.com".into(), port: 443 }.encode());
         let encoded = f.encode();
         let mut decoder = FrameDecoder::new();
 
@@ -260,7 +260,7 @@ mod tests {
                 assert_eq!(frame.conn_id, 7);
                 assert_eq!(frame.flags, FLAG_SYN);
                 let parsed = SynTarget::decode(&frame.payload).unwrap();
-                assert_eq!(parsed.address, "example.com:443");
+                assert_eq!(parsed.address, "example.com");
                 return; // success
             }
         }
@@ -287,11 +287,11 @@ mod tests {
 
     #[test]
     fn syn_target_roundtrip() {
-        let t = SynTarget { proto: PROTO_TCP, address: "example.com:443".into(), port: 443 };
+        let t = SynTarget { proto: PROTO_TCP, address: "example.com".into(), port: 443 };
         let encoded = t.encode();
         let decoded = SynTarget::decode(&encoded).unwrap();
         assert_eq!(decoded.proto, PROTO_TCP);
-        assert_eq!(decoded.address, "example.com:443");
+        assert_eq!(decoded.address, "example.com");
         assert_eq!(decoded.port, 443);
     }
 
