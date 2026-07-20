@@ -85,7 +85,7 @@ impl TunnelPool {
             }
             let skip = link.skip_rounds.load(Ordering::Acquire);
             if skip > 0 {
-                link.skip_rounds.store(skip - 1, Ordering::Release);
+                link.skip_rounds.fetch_sub(1, Ordering::Release);
                 continue;
             }
             match link.tx.try_send(frame.clone()) {
@@ -134,7 +134,7 @@ impl TunnelPool {
                         }
                     }
                 } else {
-                    link.skip_rounds.store(skip - 1, Ordering::Release);
+                    link.skip_rounds.fetch_sub(1, Ordering::Release);
                 }
             }
         }
@@ -191,6 +191,11 @@ impl ReorderBuf {
         // Gap timeout: skip the gap, signal RST — don't deliver dirty data
         if let Some(start) = self.gap_since {
             if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
+                // Advance expected past the gap so the connection can recover
+                // if the caller chooses not to RST.
+                if let Some(&max_seq) = self.pending.keys().last() {
+                    self.expected = max_seq.wrapping_add(1);
+                }
                 self.pending.clear();
                 self.gap_since = None;
                 gap_timeout = true;
@@ -401,8 +406,9 @@ async fn run_tunnel_listener(
 }
 
 /// Time between keepalive frames when the tunnel is idle.
-/// Must be less than sing-box's 25s SOCKS5 idle timeout.
-const KEEPALIVE_INTERVAL_SECS: u64 = 20;
+/// Must be well below sing-box's 25s SOCKS5 idle timeout.
+/// 12s gives 13s margin against transient TCP congestion delays.
+const KEEPALIVE_INTERVAL_SECS: u64 = 12;
 
 async fn drain_frames(
     mut rx: mpsc::Receiver<Frame>,
