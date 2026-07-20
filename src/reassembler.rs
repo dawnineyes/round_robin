@@ -58,6 +58,16 @@ impl TunnelPool {
         self.links.lock().unwrap().push(link);
     }
 
+    /// Remove dead links from the pool. Called periodically from heartbeat.
+    fn compact(&self) {
+        let mut links = self.links.lock().unwrap();
+        let before = links.len();
+        links.retain(|l| l.alive.load(Ordering::Acquire));
+        if links.len() != before {
+            self.rr.store(0, Ordering::Release);
+        }
+    }
+
     fn send(&self, frame: Frame) -> bool {
         let links = self.links.lock().unwrap();
         if links.is_empty() {
@@ -133,20 +143,31 @@ impl TunnelPool {
 
 // ── Reorder buffer ────────────────────────────────────────────────────
 
+/// Max out-of-order entries before we drop new arrivals.
+const MAX_PENDING_ENTRIES: usize = 256;
+/// If a gap persists this long, skip it and RST the connection.
+const GAP_TIMEOUT_SECS: u64 = 30;
+
 struct ReorderBuf {
     expected: u64,
     pending: BTreeMap<u64, Bytes>,
+    gap_since: Option<Instant>,
 }
 
 impl ReorderBuf {
     fn new() -> Self {
-        Self { expected: 1, pending: BTreeMap::new() }
+        Self { expected: 1, pending: BTreeMap::new(), gap_since: None }
     }
 
-    fn push(&mut self, seq: u64, payload: Bytes) -> Vec<Bytes> {
+    /// Returns (in_order_chunks, gap_timeout).
+    /// `gap_timeout` means a persistent gap was skipped — callers should
+    /// RST the connection to force cleanup on both ends.
+    fn push(&mut self, seq: u64, payload: Bytes) -> (Vec<Bytes>, bool) {
         let mut out = Vec::new();
+        let mut gap_timeout = false;
+
         if seq < self.expected {
-            return out;
+            return (out, false);
         }
         if seq == self.expected {
             out.push(payload);
@@ -155,11 +176,32 @@ impl ReorderBuf {
                 out.push(chunk);
                 self.expected = self.expected.wrapping_add(1);
             }
-        } else {
+            self.gap_since = None;
+        } else if self.pending.len() < MAX_PENDING_ENTRIES {
             self.pending.insert(seq, payload);
-            // ponytail: BTreeMap unbounded; add MAX_REORDER_WINDOW in v2
+            if self.gap_since.is_none() {
+                self.gap_since = Some(Instant::now());
+            }
         }
-        out
+
+        // Gap timeout: skip the gap, deliver pending data to unblock
+        if let Some(start) = self.gap_since {
+            if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
+                let keys: Vec<u64> = self.pending.keys().cloned().collect();
+                if let Some(&max_seq) = keys.last() {
+                    for k in keys {
+                        if let Some(chunk) = self.pending.remove(&k) {
+                            out.push(chunk);
+                        }
+                    }
+                    self.expected = max_seq.wrapping_add(1);
+                }
+                self.gap_since = None;
+                gap_timeout = true;
+            }
+        }
+
+        (out, gap_timeout)
     }
 }
 
@@ -259,6 +301,8 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
             let degraded = links.iter().filter(|l| l.skip_rounds.load(Ordering::Acquire) > 0).count();
             drop(links);
+            // Sweep dead links that accumulated from tunnel reconnects
+            hb_pool.compact();
             let uptime = start_time.elapsed().as_secs();
             info!(
                 uptime,
@@ -461,7 +505,11 @@ async fn handle_frame(
             let mut drained: u64 = 0;
             for f in queued {
                 if f.flags & FLAG_DATA != 0 {
-                    let ready = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
+                    let (ready, gap_timeout) = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
+                    if gap_timeout {
+                        conns.remove(&cid);
+                        break;
+                    }
                     for chunk in ready {
                         drained += chunk.len() as u64;
                         if !vconn.egress.write(&chunk) {
@@ -490,7 +538,13 @@ async fn handle_frame(
     if frame.flags & FLAG_DATA != 0 {
         if let Some(vconn) = conns.get(&cid) {
             let plen = frame.payload.len() as u64;
-            let ready = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
+            let (ready, gap_timeout) = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
+            if gap_timeout {
+                warn!(conn_id = cid, "reorder gap timeout → RST");
+                pool.send(Frame::rst(cid));
+                conns.remove(&cid);
+                return Ok(());
+            }
             let mut delivered: u64 = 0;
             for chunk in ready {
                 delivered += chunk.len() as u64;

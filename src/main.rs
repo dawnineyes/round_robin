@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod frame;
+mod logging;
 mod reassembler;
 mod socks5;
 mod splitter;
@@ -9,7 +10,6 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 // ── TOML config schema ────────────────────────────────────────────────
 
@@ -112,30 +112,7 @@ fn find_config() -> Result<String> {
     bail!("no config file found: tried config.toml, round_robin.toml")
 }
 
-// ── Log cleanup ───────────────────────────────────────────────────────
-
-fn purge_old_logs(log_dir: &Path, keep_days: u64) {
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(keep_days * 86400));
-    let Some(cutoff) = cutoff else { return };
-
-    let Ok(entries) = std::fs::read_dir(log_dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        // Match round_robin.YYYY-MM-DD.log
-        if !name.starts_with("round_robin.") || !name.ends_with(".log") {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(mod_time) = meta.modified() {
-                if mod_time < cutoff {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
-}
+// Log cleanup handled by logging::DailyLogWriter on daily rotation.
 
 fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
     match ports {
@@ -162,27 +139,19 @@ async fn main() -> Result<()> {
     let content = find_config()?;
     let cfg: Config = toml::from_str(&content)?;
 
-    // Conditional file logging
+    // File logging: daily rotation, no ANSI, compact format
     let log_dir = exe_dir().unwrap_or_else(|| PathBuf::from("."));
-    let _guard: Option<Box<dyn std::any::Any + Send>> = if cfg.log {
-        let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, "round_robin");
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    if cfg.log {
+        let writer = logging::DailyLogWriter::new(log_dir.clone(), "round_robin", 7)
+            .expect("failed to create log writer");
         tracing_subscriber::fmt()
-            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_target(false)
+            .compact()
+            .with_writer(writer)
             .init();
-        Some(Box::new(guard))
-    } else {
-        None
-    };
-    // _guard lives until main() exits, flushes remaining logs on drop
-
-    // Background: purge log files older than 7 days, check once per day
-    tokio::spawn(async move {
-        loop {
-            purge_old_logs(&log_dir, 7);
-            tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
-        }
-    });
+    }
+    // Stale-log purge happens on daily rotation inside DailyLogWriter.
 
     // Startup banner (goes to log file if logging enabled, otherwise discarded)
     let (listen, tunnels) = match cfg.mode.as_str() {
@@ -197,7 +166,7 @@ async fn main() -> Result<()> {
         }
         _ => (String::new(), 0),
     };
-    tracing::info!(version = "1.4", mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
+    tracing::info!(version = "1.5", mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
 
     match cfg.mode.as_str() {
         "splitter" => {

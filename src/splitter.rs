@@ -73,6 +73,16 @@ impl TunnelPool {
         self.links.lock().unwrap().len()
     }
 
+    /// Remove dead links from the pool. Called periodically from heartbeat.
+    fn compact(&self) {
+        let mut links = self.links.lock().unwrap();
+        let before = links.len();
+        links.retain(|l| l.alive.load(Ordering::Acquire));
+        if links.len() != before {
+            self.rr.store(0, Ordering::Release);
+        }
+    }
+
     /// Round-robin send. Skips full channels and degraded tunnels.
     fn send(&self, frame: Frame) -> bool {
         let links = self.links.lock().unwrap();
@@ -118,20 +128,29 @@ impl TunnelPool {
 
 // ── Reorder buffer ────────────────────────────────────────────────────
 
+/// Max out-of-order entries before we drop new arrivals.
+const MAX_PENDING_ENTRIES: usize = 256;
+/// If a gap persists this long, skip it and RST the connection.
+const GAP_TIMEOUT_SECS: u64 = 30;
+
 struct ReorderBuf {
     expected: u64,
     pending: BTreeMap<u64, Bytes>,
+    gap_since: Option<Instant>,
 }
 
 impl ReorderBuf {
     fn new() -> Self {
-        Self { expected: 1, pending: BTreeMap::new() } // DATA seq starts at 1
+        Self { expected: 1, pending: BTreeMap::new(), gap_since: None } // DATA seq starts at 1
     }
 
-    fn push(&mut self, seq: u64, payload: Bytes) -> Vec<Bytes> {
+    /// Returns (in_order_chunks, gap_timeout).
+    fn push(&mut self, seq: u64, payload: Bytes) -> (Vec<Bytes>, bool) {
         let mut out = Vec::new();
+        let mut gap_timeout = false;
+
         if seq < self.expected {
-            return out; // duplicate
+            return (out, false); // duplicate
         }
         if seq == self.expected {
             out.push(payload);
@@ -140,10 +159,32 @@ impl ReorderBuf {
                 out.push(chunk);
                 self.expected = self.expected.wrapping_add(1);
             }
-        } else {
+            self.gap_since = None;
+        } else if self.pending.len() < MAX_PENDING_ENTRIES {
             self.pending.insert(seq, payload);
+            if self.gap_since.is_none() {
+                self.gap_since = Some(Instant::now());
+            }
         }
-        out
+
+        // Gap timeout: skip the gap, deliver pending data to unblock
+        if let Some(start) = self.gap_since {
+            if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
+                let keys: Vec<u64> = self.pending.keys().cloned().collect();
+                if let Some(&max_seq) = keys.last() {
+                    for k in keys {
+                        if let Some(chunk) = self.pending.remove(&k) {
+                            out.push(chunk);
+                        }
+                    }
+                    self.expected = max_seq.wrapping_add(1);
+                }
+                self.gap_since = None;
+                gap_timeout = true;
+            }
+        }
+
+        (out, gap_timeout)
     }
 }
 
@@ -163,14 +204,16 @@ struct VirtConn {
 }
 
 impl VirtConn {
-    fn on_frame(&self, seq: u64, payload: Bytes) {
+    /// Returns true if a persistent gap just timed out — caller should RST.
+    fn on_frame(&self, seq: u64, payload: Bytes) -> bool {
         let plen = payload.len() as u64;
-        let ready = self.reorder.lock().unwrap().push(seq, payload);
+        let (ready, gap_timeout) = self.reorder.lock().unwrap().push(seq, payload);
         for chunk in ready {
             let _ = self.to_client_tx.send(chunk);
         }
         self.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         self.frames_recv.fetch_add(1, Ordering::Relaxed);
+        gap_timeout
     }
 
     fn on_ack(&self, ack_bytes: u64, window: u32) {
@@ -272,6 +315,8 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
             let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
             let degraded = links.iter().filter(|l| l.skip_rounds.load(Ordering::Acquire) > 0).count();
             drop(links);
+            // Sweep dead links that accumulated from tunnel reconnects
+            hb_pool.compact();
             let uptime = start_time.elapsed().as_secs();
             info!(
                 uptime,
@@ -353,7 +398,7 @@ async fn tunnel_read_loop(
 
 // ── Inbound frame dispatch ────────────────────────────────────────────
 
-fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, _pool: &TunnelPool) {
+fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool: &TunnelPool) {
     if frame.flags & FLAG_SYN != 0 && frame.flags & FLAG_ACK != 0 {
         // SYN+ACK: handshake complete — handled by the pending oneshot in handle_client
         // Frame just arrives; the oneshot is triggered elsewhere after the initial SYN is sent.
@@ -363,7 +408,13 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, _pool
 
     if frame.flags & FLAG_DATA != 0 {
         if let Some(conn) = conns.get(&frame.conn_id) {
-            conn.on_frame(frame.seq, frame.payload);
+            if conn.on_frame(frame.seq, frame.payload) {
+                // Reorder gap timeout — tear down the connection
+                conn.closed.store(true, Ordering::Release);
+                conn.ack_notify.notify_one();
+                conns.remove(&frame.conn_id);
+                pool.send(Frame::rst(frame.conn_id));
+            }
         }
         // Unknown conn_id: stale/dangling, drop
         return;
