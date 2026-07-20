@@ -711,8 +711,21 @@ async fn read_from_egress(
             Ok(0) => break,
             Ok(n) => {
                 let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
-                if !pool.send(frame) {
-                    warn!(conn_id, "no live tunnels for egress response");
+                // Backpressure: if all tunnel channels are momentarily full,
+                // yield and retry instead of killing the connection.
+                let mut sent = false;
+                for retry in 0..5 {
+                    if pool.send(frame.clone()) {
+                        sent = true;
+                        break;
+                    }
+                    if retry == 0 {
+                        warn!(conn_id, "egress backpressure, retrying");
+                    }
+                    tokio::task::yield_now().await;
+                }
+                if !sent {
+                    warn!(conn_id, "no live tunnels for egress response after retries");
                     break;
                 }
                 // Count on the VirtConnDe
