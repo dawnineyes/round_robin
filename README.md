@@ -148,8 +148,8 @@ SYN 帧 Payload: `Proto(u8) + AddrLen(u16) + Address(variable) + Port(u16)`
 ## 发布
 
 ```bash
-git tag v1.0
-git push origin v1.0
+git tag v1.6
+git push origin v1.6
 ```
 
 GitHub Actions 自动编译 Linux x86_64 二进制并发布 Release。
