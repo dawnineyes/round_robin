@@ -1,13 +1,15 @@
 use anyhow::{bail, Result};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 // ── SOCKS5 constants ──────────────────────────────────────────────────
 
 const SOCKS_VERSION: u8 = 0x05;
 const AUTH_NONE: u8 = 0x00;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
@@ -16,8 +18,13 @@ const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 
 // ── Server-side: accept a SOCKS5 client ───────────────────────────────
 
-/// Result of a SOCKS5 server-side handshake: the target the client wants
-/// to CONNECT to, and the stream positioned after the reply.
+/// Result of a SOCKS5 server-side handshake.
+pub enum Socks5Result {
+    Connect(Socks5Accept),
+    UdpAssociate { stream: TcpStream, relay: UdpSocket },
+}
+
+/// Result of a SOCKS5 CONNECT: the target the client wants and the stream.
 pub struct Socks5Accept {
     pub target: TargetAddr,
     pub stream: TcpStream,
@@ -31,9 +38,9 @@ pub struct TargetAddr {
 
 /// Perform SOCKS5 server-side handshake on `stream`:
 /// 1. Read greeting → negotiate no-auth
-/// 2. Read CONNECT request → parse target
+/// 2. Read request → if CONNECT, parse target; if UDP ASSOCIATE, create relay
 /// 3. Reply success
-pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Accept> {
+pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result> {
     // 1. Greeting
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr).await?;
@@ -43,7 +50,6 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Accept>
     let nmethods = hdr[1] as usize;
     let mut methods = vec![0u8; nmethods.min(16)];
     stream.read_exact(&mut methods).await?;
-    // Drain excess methods
     if nmethods > 16 {
         let mut drain = vec![0u8; nmethods - 16];
         stream.read_exact(&mut drain).await?;
@@ -60,19 +66,48 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Accept>
     if req[0] != SOCKS_VERSION {
         bail!("bad SOCKS5 request version");
     }
-    if req[1] != CMD_CONNECT {
-        // Reply: command not supported
-        let rep = [SOCKS_VERSION, REP_CMD_NOT_SUPPORTED, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
-        stream.write_all(&rep).await?;
-        bail!("only CONNECT supported, got cmd={}", req[1]);
+
+    match req[1] {
+        CMD_CONNECT => {
+            let target = read_address(&mut stream, req[3]).await?;
+            let rep = [SOCKS_VERSION, REP_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+            stream.write_all(&rep).await?;
+            Ok(Socks5Result::Connect(Socks5Accept { target, stream }))
+        }
+        CMD_UDP_ASSOCIATE => {
+            let client_addr = read_address(&mut stream, req[3]).await?;
+            // Bind a UDP relay on the same IP the TCP listener uses
+            let local = stream.local_addr()?;
+            let relay = UdpSocket::bind((local.ip(), 0u16)).await?;
+            let relay_addr = relay.local_addr()?;
+            let rep = encode_reply(REP_SUCCESS, relay_addr);
+            stream.write_all(&rep).await?;
+            let _ = client_addr; // ponytail: client_addr unused for single-client setup
+            Ok(Socks5Result::UdpAssociate { stream, relay })
+        }
+        other => {
+            let rep = [SOCKS_VERSION, REP_CMD_NOT_SUPPORTED, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+            stream.write_all(&rep).await?;
+            bail!("unsupported CMD={other}, only CONNECT/UDP_ASSOCIATE supported");
+        }
     }
-    let target = read_address(&mut stream, req[3]).await?;
+}
 
-    // 3. Reply success (bind addr = 0.0.0.0:0)
-    let rep = [SOCKS_VERSION, REP_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
-    stream.write_all(&rep).await?;
-
-    Ok(Socks5Accept { target, stream })
+/// Encode a SOCKS5 reply with the given bind address.
+fn encode_reply(rep: u8, addr: SocketAddr) -> Vec<u8> {
+    let mut v = vec![SOCKS_VERSION, rep, 0x00];
+    match addr {
+        SocketAddr::V4(a) => {
+            v.push(ATYP_IPV4);
+            v.extend_from_slice(&a.ip().octets());
+        }
+        SocketAddr::V6(a) => {
+            v.push(ATYP_IPV6);
+            v.extend_from_slice(&a.ip().octets());
+        }
+    }
+    v.extend_from_slice(&addr.port().to_be_bytes());
+    v
 }
 
 /// SOCKS5 server handshake for tunnel links: accept no-auth, accept any
@@ -239,4 +274,99 @@ fn encode_address(host: &str, port: u16) -> Vec<u8> {
     v.extend_from_slice(name);
     v.extend_from_slice(&port.to_be_bytes());
     v
+}
+
+// ── UDP datagram helpers (RFC 1928 §7) ────────────────────────────────
+
+/// Encode a SOCKS5 UDP datagram: RSV(2) + FRAG(1) + ATYP(1) + ADDR(var) + PORT(2) + DATA(var)
+pub fn encode_udp_datagram(target: &TargetAddr, data: &[u8]) -> Bytes {
+    let addr = encode_address(&target.address, target.port);
+    let mut buf = BytesMut::with_capacity(3 + addr.len() + data.len());
+    buf.put_u16(0); // RSV
+    buf.put_u8(0);  // FRAG (fragmentation not supported)
+    buf.put_slice(&addr);
+    buf.put_slice(data);
+    buf.freeze()
+}
+
+/// Decode a SOCKS5 UDP datagram. Returns (target, data).
+pub fn decode_udp_datagram(payload: &[u8]) -> Result<(TargetAddr, Bytes)> {
+    if payload.len() < 4 {
+        bail!("UDP datagram too short");
+    }
+    let frag = payload[2];
+    if frag != 0 {
+        bail!("UDP fragmentation not supported");
+    }
+    let atyp = payload[3];
+    // Reuse address parser on a cursor-like slice
+    let addr_data = &payload[3..];
+    let (addr, port, consumed) = parse_udp_address(atyp, addr_data)?;
+    let data = Bytes::copy_from_slice(&payload[3 + consumed..]);
+    Ok((TargetAddr { address: addr, port }, data))
+}
+
+fn parse_udp_address(atyp: u8, data: &[u8]) -> Result<(String, u16, usize)> {
+    match atyp {
+        ATYP_IPV4 => {
+            if data.len() < 7 {
+                bail!("truncated IPv4 in UDP datagram");
+            }
+            let addr = format!("{}.{}.{}.{}", data[1], data[2], data[3], data[4]);
+            let port = u16::from_be_bytes([data[5], data[6]]);
+            Ok((addr, port, 7))
+        }
+        ATYP_DOMAIN => {
+            if data.len() < 2 {
+                bail!("truncated domain in UDP datagram");
+            }
+            let len = data[1] as usize;
+            if data.len() < 4 + len {
+                bail!("truncated domain data");
+            }
+            let addr = String::from_utf8(data[2..2 + len].to_vec())?;
+            let port = u16::from_be_bytes([data[2 + len], data[3 + len]]);
+            Ok((addr, port, 4 + len))
+        }
+        ATYP_IPV6 => {
+            if data.len() < 19 {
+                bail!("truncated IPv6 in UDP datagram");
+            }
+            let segs: Vec<String> = data[1..17]
+                .chunks(2)
+                .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+                .collect();
+            let addr = segs.join(":");
+            let port = u16::from_be_bytes([data[17], data[18]]);
+            Ok((addr, port, 19))
+        }
+        _ => bail!("unsupported ATYP in UDP datagram: {atyp}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_datagram_ipv4_roundtrip() {
+        let target = TargetAddr { address: "1.2.3.4".into(), port: 53 };
+        let data = b"hello udp";
+        let encoded = encode_udp_datagram(&target, data);
+        let (decoded_target, decoded_data) = decode_udp_datagram(&encoded).unwrap();
+        assert_eq!(decoded_target.address, "1.2.3.4");
+        assert_eq!(decoded_target.port, 53);
+        assert_eq!(&decoded_data[..], b"hello udp");
+    }
+
+    #[test]
+    fn udp_datagram_domain_roundtrip() {
+        let target = TargetAddr { address: "dns.google".into(), port: 53 };
+        let data = vec![0u8; 32];
+        let encoded = encode_udp_datagram(&target, &data);
+        let (decoded_target, decoded_data) = decode_udp_datagram(&encoded).unwrap();
+        assert_eq!(decoded_target.address, "dns.google");
+        assert_eq!(decoded_target.port, 53);
+        assert_eq!(decoded_data.len(), 32);
+    }
 }

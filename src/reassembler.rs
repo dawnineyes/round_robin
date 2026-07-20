@@ -5,12 +5,21 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+const TUNNEL_CHAN_CAP: usize = 64;
+const STRIKE_THRESHOLD: u32 = 3;
+const COOLDOWN_ROUNDS: u32 = 16;
+/// Send ACK to splitter every N bytes delivered.
+const ACK_INTERVAL_BYTES: u64 = 65536;
+/// Max bytes the reorder buffer can hold before we signal splitter to slow down.
+const MAX_REORDER_WINDOW: u32 = 262144;
+const UDP_CONN_ID: u32 = 0;
 
 // ── Config ────────────────────────────────────────────────────────────
 
@@ -24,8 +33,10 @@ pub struct ReassemblerConfig {
 // ── Tunnel pool (same pattern as splitter) ────────────────────────────
 
 struct TunnelLink {
-    tx: mpsc::UnboundedSender<Frame>,
+    tx: mpsc::Sender<Frame>,
     alive: AtomicBool,
+    strikes: AtomicU32,
+    skip_rounds: AtomicU32,
 }
 
 struct TunnelPool {
@@ -52,25 +63,63 @@ impl TunnelPool {
         for i in 0..n {
             let idx = (start + i) % n;
             let link = &links[idx];
-            if link.alive.load(Ordering::Acquire) {
-                if link.tx.send(frame.clone()).is_ok() {
+            if !link.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            let skip = link.skip_rounds.load(Ordering::Acquire);
+            if skip > 0 {
+                link.skip_rounds.store(skip - 1, Ordering::Release);
+                continue;
+            }
+            match link.tx.try_send(frame.clone()) {
+                Ok(()) => {
+                    link.strikes.store(0, Ordering::Release);
                     return true;
                 }
-                link.alive.store(false, Ordering::Release);
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let s = link.strikes.fetch_add(1, Ordering::AcqRel) + 1;
+                    if s >= STRIKE_THRESHOLD {
+                        link.strikes.store(0, Ordering::Release);
+                        link.skip_rounds.store(COOLDOWN_ROUNDS, Ordering::Release);
+                        warn!("tunnel {idx}: degraded, cooldown {COOLDOWN_ROUNDS} rounds");
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    link.alive.store(false, Ordering::Release);
+                }
             }
         }
         false
     }
 
     fn send_via(&self, frame: Frame, src_link: usize) -> bool {
-        // Prefer the source link; fall back to round-robin
         let links = self.links.lock().unwrap();
         if src_link < links.len() {
             let link = &links[src_link];
-            if link.alive.load(Ordering::Acquire) && link.tx.send(frame.clone()).is_ok() {
-                return true;
+            if link.alive.load(Ordering::Acquire) {
+                let skip = link.skip_rounds.load(Ordering::Acquire);
+                if skip == 0 {
+                    match link.tx.try_send(frame.clone()) {
+                        Ok(()) => {
+                            link.strikes.store(0, Ordering::Release);
+                            return true;
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            let s = link.strikes.fetch_add(1, Ordering::AcqRel) + 1;
+                            if s >= STRIKE_THRESHOLD {
+                                link.strikes.store(0, Ordering::Release);
+                                link.skip_rounds.store(COOLDOWN_ROUNDS, Ordering::Release);
+                                warn!("tunnel {src_link}: degraded, cooldown");
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            link.alive.store(false, Ordering::Release);
+                        }
+                    }
+                } else {
+                    link.skip_rounds.store(skip - 1, Ordering::Release);
+                }
             }
-            link.alive.store(false, Ordering::Release);
         }
         drop(links);
         self.send(frame)
@@ -126,6 +175,10 @@ impl EgressConn {
 struct VirtConnDe {
     egress: EgressConn,
     reorder: Mutex<ReorderBuf>,
+    /// Cumulative bytes delivered in-order to egress (for ACK).
+    delivered_bytes: AtomicU64,
+    /// Last delivered_bytes value we sent an ACK for.
+    last_acked: AtomicU64,
 }
 
 type ConnMap = Arc<DashMap<u32, Arc<VirtConnDe>>>;
@@ -139,6 +192,36 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let pending: PendingMap = Arc::new(DashMap::new());
     let pool = Arc::new(TunnelPool::new());
 
+    // Global UDP socket for relay (responses from targets come back here)
+    let udp_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    info!("reassembler: UDP relay on {}", udp_sock.local_addr()?);
+
+    // Background: read UDP responses from targets → DATA frames → pool
+    {
+        let udp = udp_sock.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match udp.recv_from(&mut buf).await {
+                    Ok((n, src)) => {
+                        // Wrap in SOCKS5 UDP response header
+                        let src_target = socks5::TargetAddr {
+                            address: src.ip().to_string(),
+                            port: src.port(),
+                        };
+                        let dgram = socks5::encode_udp_datagram(&src_target, &buf[..n]);
+                        let frame = Frame::data(UDP_CONN_ID, 1, dgram);
+                        pool.send(frame);
+                    }
+                    Err(e) => {
+                        warn!("UDP relay recv error: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     // Spawn a listener for each port
     for &port in &cfg.listen_ports {
         let conns = conns.clone();
@@ -146,8 +229,9 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let pool = pool.clone();
         let local_target = cfg.local_target;
         let listen_ip = cfg.listen_ip;
+        let udp = udp_sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_tunnel_listener(listen_ip, port, local_target, conns, pending, pool, cfg.chunk_size).await {
+            if let Err(e) = run_tunnel_listener(listen_ip, port, local_target, conns, pending, pool, cfg.chunk_size, udp).await {
                 error!("listener on port {port} died: {e}");
             }
         });
@@ -169,6 +253,7 @@ async fn run_tunnel_listener(
     pending: PendingMap,
     pool: Arc<TunnelPool>,
     chunk_size: usize,
+    udp_sock: Arc<UdpSocket>,
 ) -> Result<()> {
     let listener = TcpListener::bind((listen_ip, port)).await?;
     info!("reassembler: tunnel listener on {listen_ip}:{port}");
@@ -190,8 +275,13 @@ async fn run_tunnel_listener(
         info!("tunnel link from {peer} on port {port} (pool size {})", pool.links.lock().unwrap().len() + 1);
 
         let (rd, wr) = stream.into_split();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let link = Arc::new(TunnelLink { tx, alive: AtomicBool::new(true) });
+        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHAN_CAP);
+        let link = Arc::new(TunnelLink {
+            tx,
+            alive: AtomicBool::new(true),
+            strikes: AtomicU32::new(0),
+            skip_rounds: AtomicU32::new(0),
+        });
         pool.add(link.clone());
 
         // Writer task
@@ -201,8 +291,9 @@ async fn run_tunnel_listener(
         let conns = conns.clone();
         let pending = pending.clone();
         let pool = pool.clone();
+        let udp = udp_sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = tunnel_read_loop(rd, conns, pending, pool, local_target, port as usize, chunk_size).await {
+            if let Err(e) = tunnel_read_loop(rd, conns, pending, pool, local_target, port as usize, chunk_size, udp).await {
                 warn!("tunnel link from {peer}: {e}");
             }
             link.alive.store(false, Ordering::Release);
@@ -210,7 +301,7 @@ async fn run_tunnel_listener(
     }
 }
 
-async fn drain_frames(mut rx: mpsc::UnboundedReceiver<Frame>, mut wr: tokio::net::tcp::OwnedWriteHalf) {
+async fn drain_frames(mut rx: mpsc::Receiver<Frame>, mut wr: tokio::net::tcp::OwnedWriteHalf) {
     while let Some(frame) = rx.recv().await {
         if wr.write_all(&frame.encode()).await.is_err() {
             break;
@@ -227,6 +318,7 @@ async fn tunnel_read_loop(
     local_target: SocketAddr,
     src_port: usize,
     chunk_size: usize,
+    udp_sock: Arc<UdpSocket>,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
@@ -234,7 +326,7 @@ async fn tunnel_read_loop(
             Some(f) => f,
             None => return Ok(()),
         };
-        handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size).await?;
+        handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size, &udp_sock).await?;
     }
 }
 
@@ -248,8 +340,14 @@ async fn handle_frame(
     local_target: SocketAddr,
     src_port: usize,
     chunk_size: usize,
+    udp_sock: &Arc<UdpSocket>,
 ) -> Result<()> {
     let cid = frame.conn_id;
+
+    // UDP relay: conn_id 0, DATA → send to target
+    if cid == UDP_CONN_ID && frame.flags & FLAG_DATA != 0 {
+        return handle_udp_frame(frame, udp_sock).await;
+    }
 
     // SYN: new virtual connection
     if frame.flags & FLAG_SYN != 0 {
@@ -285,6 +383,8 @@ async fn handle_frame(
         let vconn = Arc::new(VirtConnDe {
             egress: EgressConn { write_tx },
             reorder: Mutex::new(ReorderBuf::new()),
+            delivered_bytes: AtomicU64::new(0),
+            last_acked: AtomicU64::new(0),
         });
 
         // Spawn egress writer: ordered data → egress connection
@@ -299,10 +399,12 @@ async fn handle_frame(
 
         // Drain any frames that arrived during SOCKS5 connect
         if let Some((_, queued)) = pending.remove(&cid) {
+            let mut drained: u64 = 0;
             for f in queued {
                 if f.flags & FLAG_DATA != 0 {
                     let ready = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
                     for chunk in ready {
+                        drained += chunk.len() as u64;
                         if !vconn.egress.write(&chunk) {
                             warn!("conn {cid}: egress write failed (drain)");
                             break;
@@ -312,6 +414,9 @@ async fn handle_frame(
                     info!("conn {cid}: FIN during SYN, cleaning up");
                     conns.remove(&cid);
                 }
+            }
+            if drained > 0 {
+                send_ack_if_needed(cid, &vconn, drained, pool);
             }
         }
 
@@ -326,17 +431,20 @@ async fn handle_frame(
     if frame.flags & FLAG_DATA != 0 {
         if let Some(vconn) = conns.get(&cid) {
             let ready = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
+            let mut delivered: u64 = 0;
             for chunk in ready {
+                delivered += chunk.len() as u64;
                 if !vconn.egress.write(&chunk) {
                     warn!("conn {cid}: egress write failed");
                     break;
                 }
             }
+            if delivered > 0 {
+                send_ack_if_needed(cid, &vconn, delivered, pool);
+            }
         } else if let Some(mut entry) = pending.get_mut(&cid) {
-            // SYN is still in progress, queue this frame
             entry.push(frame);
         }
-        // else: conn already cleaned up, drop frame
         return Ok(());
     }
 
@@ -367,6 +475,27 @@ async fn handle_frame(
     }
 
     Ok(())
+}
+
+// ── UDP relay handler ─────────────────────────────────────────────────
+
+async fn handle_udp_frame(frame: Frame, udp_sock: &UdpSocket) -> Result<()> {
+    let (target, data) = socks5::decode_udp_datagram(&frame.payload)?;
+    udp_sock.send_to(&data, (target.address.as_str(), target.port)).await?;
+    Ok(())
+}
+
+// ── ACK helper ────────────────────────────────────────────────────────
+
+fn send_ack_if_needed(cid: u32, vconn: &VirtConnDe, delivered: u64, pool: &TunnelPool) {
+    let total = vconn.delivered_bytes.fetch_add(delivered, Ordering::AcqRel) + delivered;
+    let last = vconn.last_acked.load(Ordering::Acquire);
+    if total.saturating_sub(last) >= ACK_INTERVAL_BYTES {
+        let pending_est = vconn.reorder.lock().unwrap().pending.len() as u32 * 16384;
+        let window = MAX_REORDER_WINDOW.saturating_sub(pending_est);
+        let _ = pool.send(crate::frame::Frame::ack(cid, total, window));
+        vconn.last_acked.store(total, Ordering::Release);
+    }
 }
 
 // ── Egress I/O tasks ──────────────────────────────────────────────────
