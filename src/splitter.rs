@@ -356,18 +356,38 @@ async fn establish_tunnel(ep: &TunnelEndpoint) -> Result<TcpStream> {
     Ok(stream)
 }
 
+/// Time between keepalive frames when the tunnel is idle.
+/// Must be less than sing-box's 25s SOCKS5 idle timeout.
+const KEEPALIVE_INTERVAL_SECS: u64 = 20;
+
 async fn drain_frames(
     mut rx: mpsc::Receiver<Frame>,
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     link: Arc<TunnelLink>,
 ) {
-    while let Some(frame) = rx.recv().await {
-        let n = frame.payload.len() as u64;
-        if wr.write_all(&frame.encode()).await.is_err() {
-            break;
+    let ka = Frame { conn_id: 0, seq: 0, flags: 0, payload: Bytes::new() };
+    let ka_bytes = ka.encode();
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                match frame {
+                    Some(frame) => {
+                        let n = frame.payload.len() as u64;
+                        if wr.write_all(&frame.encode()).await.is_err() {
+                            break;
+                        }
+                        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
+                        link.frames_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)) => {
+                if wr.write_all(&ka_bytes).await.is_err() {
+                    break;
+                }
+            }
         }
-        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
-        link.frames_sent.fetch_add(1, Ordering::Relaxed);
     }
     let _ = wr.shutdown().await;
 }
@@ -572,22 +592,37 @@ async fn handle_tcp_client(
             credit_exhausted = false;
         }
 
-        match client_reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                vconn.consume_credit(n);
-                let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
-                if !pool.send(frame) {
-                    warn!(conn_id, "no live tunnels, aborting");
+        // Race client read against close/ACK notifications.
+        // Without this, a FIN from the reassembler would leave us
+        // stuck in read() while the browser holds the connection open
+        // (HTTP keep-alive), and the hung connection keeps tunnels in
+        // short-timeout mode, causing tunnel cycling.
+        tokio::select! {
+            result = client_reader.read(&mut buf) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        vconn.consume_credit(n);
+                        let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
+                        if !pool.send(frame) {
+                            warn!(conn_id, "no live tunnels, aborting");
+                            break;
+                        }
+                        vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                        vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
+                        seq += 1;
+                    }
+                    Err(e) => {
+                        warn!(conn_id, error = %e, "client read error");
+                        break;
+                    }
+                }
+            }
+            _ = vconn.ack_notify.notified() => {
+                if vconn.closed.load(Ordering::Acquire) {
                     break;
                 }
-                vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
-                seq += 1;
-            }
-            Err(e) => {
-                warn!(conn_id, error = %e, "client read error");
-                break;
+                // Credit or other update — loop back to recheck state
             }
         }
     }

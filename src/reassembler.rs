@@ -382,18 +382,38 @@ async fn run_tunnel_listener(
     }
 }
 
+/// Time between keepalive frames when the tunnel is idle.
+/// Must be less than sing-box's 25s SOCKS5 idle timeout.
+const KEEPALIVE_INTERVAL_SECS: u64 = 20;
+
 async fn drain_frames(
     mut rx: mpsc::Receiver<Frame>,
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     link: Arc<TunnelLink>,
 ) {
-    while let Some(frame) = rx.recv().await {
-        let n = frame.payload.len() as u64;
-        if wr.write_all(&frame.encode()).await.is_err() {
-            break;
+    let ka = Frame { conn_id: 0, seq: 0, flags: 0, payload: Bytes::new() };
+    let ka_bytes = ka.encode();
+    loop {
+        tokio::select! {
+            frame = rx.recv() => {
+                match frame {
+                    Some(frame) => {
+                        let n = frame.payload.len() as u64;
+                        if wr.write_all(&frame.encode()).await.is_err() {
+                            break;
+                        }
+                        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
+                        link.frames_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)) => {
+                if wr.write_all(&ka_bytes).await.is_err() {
+                    break;
+                }
+            }
         }
-        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
-        link.frames_sent.fetch_add(1, Ordering::Relaxed);
     }
     let _ = wr.shutdown().await;
 }
