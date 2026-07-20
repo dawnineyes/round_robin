@@ -149,6 +149,8 @@ impl TunnelPool {
 const MAX_PENDING_ENTRIES: usize = 256;
 /// If a gap persists this long, skip it and RST the connection.
 const GAP_TIMEOUT_SECS: u64 = 30;
+/// Max number of pending cids with DATA-before-SYN buffered.
+const MAX_PENDING_CIDS: usize = 256;
 
 struct ReorderBuf {
     expected: u64,
@@ -475,8 +477,9 @@ async fn handle_frame(
     // SYN: new virtual connection
     if frame.flags & FLAG_SYN != 0 {
         // Reserve a pending slot so DATA/FIN arriving during SOCKS5 connect
-        // are queued instead of dropped
-        pending.insert(cid, Vec::new());
+        // are queued instead of dropped.  Use entry API so we don't
+        // overwrite DATA frames that already arrived before the SYN.
+        pending.entry(cid).or_insert_with(Vec::new);
 
         // Parse target from SYN payload
         let syn_target = SynTarget::decode(&frame.payload)?;
@@ -586,16 +589,14 @@ async fn handle_frame(
             return Ok(());
         }
         // Not in conns — could be pending (SYN still in flight) or
-        // stale (splitter restarted).  Drop silently — the pending
-        // slot is only created when SYN is being processed.  Sending
-        // RST here would kill legitimate connections whose DATA frames
-        // beat the SYN across different tunnels (out-of-order delivery).
+        // DATA arrived before SYN (out-of-order delivery across tunnels).
+        // Create a pending slot so data isn't lost — the SYN handler
+        // will drain it once the egress connection is established.
         if let Some(mut entry) = pending.get_mut(&cid) {
             entry.push(frame);
+        } else if pending.len() < MAX_PENDING_CIDS {
+            pending.insert(cid, vec![frame]);
         }
-        // Stale frames are harmless: they consume a tiny amount of
-        // tunnel bandwidth, and the stale splitter-side connection
-        // eventually times out on its own (credit timeout or browser).
         return Ok(());
     }
 
