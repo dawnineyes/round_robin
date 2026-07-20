@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -21,6 +21,10 @@ const STRIKE_THRESHOLD: u32 = 3;
 const COOLDOWN_ROUNDS: u32 = 16;
 /// Initial send credit (bytes) before first ACK arrives.
 const INITIAL_CREDIT: i64 = 262144;
+/// If a tunnel receives no frames for this long, it is considered dead and reconnected.
+const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
+/// Max time to wait for credit (ACK) before closing connection as dead.
+const CREDIT_TIMEOUT_SECS: u64 = 15;
 /// Reserved conn_id for UDP relay traffic.
 const UDP_CONN_ID: u32 = 0;
 
@@ -385,9 +389,18 @@ async fn tunnel_read_loop(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
-        let frame = match decoder.try_next(&mut rd).await? {
-            Some(f) => f,
-            None => return Ok(()),
+        let frame = match tokio::time::timeout(
+            Duration::from_secs(TUNNEL_READ_TIMEOUT_SECS),
+            decoder.try_next(&mut rd),
+        )
+        .await
+        {
+            Ok(Ok(Some(f))) => f,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                bail!("tunnel read idle timeout after {TUNNEL_READ_TIMEOUT_SECS}s");
+            }
         };
         let plen = frame.payload.len() as u64;
         handle_inbound_frame(frame, tunnel_idx, conns, pool);
@@ -531,7 +544,27 @@ async fn handle_tcp_client(
                 info!(conn_id, "flow: credit exhausted, pausing");
                 credit_exhausted = true;
             }
-            vconn.ack_notify.notified().await;
+            {
+                let notified = vconn.ack_notify.notified();
+                // Double-check: ACK may have arrived between has_credit()
+                // and notified() creation — Notify does not capture past events.
+                if vconn.has_credit() {
+                    break; // credit restored, no need to wait
+                }
+                match tokio::time::timeout(
+                    Duration::from_secs(CREDIT_TIMEOUT_SECS),
+                    notified,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        warn!(conn_id, timeout = CREDIT_TIMEOUT_SECS, "credit timeout, no ACK — closing");
+                        vconn.closed.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
         }
         if vconn.closed.load(Ordering::Acquire) {
             break;

@@ -1,13 +1,13 @@
 use crate::frame::{AckInfo, Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::socks5;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -21,6 +21,8 @@ const ACK_INTERVAL_BYTES: u64 = 65536;
 /// Max bytes the reorder buffer can hold before we signal splitter to slow down.
 const MAX_REORDER_WINDOW: u32 = 262144;
 const UDP_CONN_ID: u32 = 0;
+/// If a tunnel receives no frames for this long, it is considered dead and reconnected.
+const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
 
 // ── Config ────────────────────────────────────────────────────────────
 
@@ -417,9 +419,18 @@ async fn tunnel_read_loop(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
-        let frame = match decoder.try_next(&mut rd).await? {
-            Some(f) => f,
-            None => return Ok(()),
+        let frame = match tokio::time::timeout(
+            Duration::from_secs(TUNNEL_READ_TIMEOUT_SECS),
+            decoder.try_next(&mut rd),
+        )
+        .await
+        {
+            Ok(Ok(Some(f))) => f,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                bail!("tunnel read idle timeout after {TUNNEL_READ_TIMEOUT_SECS}s");
+            }
         };
         let plen = frame.payload.len() as u64;
         handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size, &udp_sock).await?;
