@@ -419,8 +419,10 @@ async fn tunnel_read_loop(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
+        // Adaptive timeout: short when connections are active, long when idle.
+        let timeout = if conns.is_empty() { 300 } else { TUNNEL_READ_TIMEOUT_SECS };
         let frame = match tokio::time::timeout(
-            Duration::from_secs(TUNNEL_READ_TIMEOUT_SECS),
+            Duration::from_secs(timeout),
             decoder.try_next(&mut rd),
         )
         .await
@@ -429,7 +431,7 @@ async fn tunnel_read_loop(
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
-                bail!("tunnel read idle timeout after {TUNNEL_READ_TIMEOUT_SECS}s");
+                bail!("tunnel read idle timeout after {timeout}s");
             }
         };
         let plen = frame.payload.len() as u64;
