@@ -573,12 +573,17 @@ async fn handle_frame(
             }
             return Ok(());
         }
-        // Not in conns — could be pending (SYN still in flight) or stale (splitter restarted)
+        // Not in conns — could be pending (SYN still in flight) or
+        // stale (splitter restarted).  Drop silently — the pending
+        // slot is only created when SYN is being processed.  Sending
+        // RST here would kill legitimate connections whose DATA frames
+        // beat the SYN across different tunnels (out-of-order delivery).
         if let Some(mut entry) = pending.get_mut(&cid) {
             entry.push(frame);
-        } else {
-            pool.send(Frame::rst(cid));
         }
+        // Stale frames are harmless: they consume a tiny amount of
+        // tunnel bandwidth, and the stale splitter-side connection
+        // eventually times out on its own (credit timeout or browser).
         return Ok(());
     }
 

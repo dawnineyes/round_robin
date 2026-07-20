@@ -431,10 +431,11 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool:
                 conns.remove(&frame.conn_id);
                 pool.send(Frame::rst(frame.conn_id));
             }
+        } else {
+            // Unknown conn_id: stale/dangling. Send RST so the
+            // reassembler cleans up and stops flooding the tunnel.
+            pool.send(Frame::rst(frame.conn_id));
         }
-        // Unknown conn_id: stale/dangling. Send RST so the
-        // reassembler cleans up and stops flooding the tunnel.
-        pool.send(Frame::rst(frame.conn_id));
         return;
     }
 
