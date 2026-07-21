@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
         }
         _ => (String::new(), 0),
     };
-    tracing::info!(version = "1.6", mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), mode = %cfg.mode, log = cfg.log, listen, tunnels, "round_robin starting");
 
     match cfg.mode.as_str() {
         "splitter" => {
