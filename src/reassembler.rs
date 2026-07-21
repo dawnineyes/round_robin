@@ -13,9 +13,6 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-const TUNNEL_CHAN_CAP: usize = 64;
-const STRIKE_THRESHOLD: u32 = 3;
-const COOLDOWN_ROUNDS: u32 = 16;
 const UDP_CONN_ID: u32 = 0;
 /// If a tunnel receives no frames for this long, it is considered dead and reconnected.
 const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
@@ -32,7 +29,7 @@ pub struct ReassemblerConfig {
 // ── Tunnel pool (same pattern as splitter) ────────────────────────────
 
 struct TunnelLink {
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::UnboundedSender<Frame>,
     alive: AtomicBool,
     strikes: AtomicU32,
     skip_rounds: AtomicU32,
@@ -84,20 +81,12 @@ impl TunnelPool {
                 link.skip_rounds.fetch_sub(1, Ordering::Release);
                 continue;
             }
-            match link.tx.try_send(frame.clone()) {
+            match link.tx.send(frame.clone()) {
                 Ok(()) => {
                     link.strikes.store(0, Ordering::Release);
                     return true;
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    let s = link.strikes.fetch_add(1, Ordering::AcqRel) + 1;
-                    if s >= STRIKE_THRESHOLD {
-                        link.strikes.store(0, Ordering::Release);
-                        link.skip_rounds.store(COOLDOWN_ROUNDS, Ordering::Release);
-                        warn!(tunnel = idx, cooldown = COOLDOWN_ROUNDS, "degraded");
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(_) => {
                     link.alive.store(false, Ordering::Release);
                 }
             }
@@ -112,22 +101,11 @@ impl TunnelPool {
             if link.alive.load(Ordering::Acquire) {
                 let skip = link.skip_rounds.load(Ordering::Acquire);
                 if skip == 0 {
-                    match link.tx.try_send(frame.clone()) {
-                        Ok(()) => {
-                            link.strikes.store(0, Ordering::Release);
-                            return true;
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            let s = link.strikes.fetch_add(1, Ordering::AcqRel) + 1;
-                            if s >= STRIKE_THRESHOLD {
-                                link.strikes.store(0, Ordering::Release);
-                                link.skip_rounds.store(COOLDOWN_ROUNDS, Ordering::Release);
-                                warn!(tunnel = src_link, "degraded, cooldown");
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            link.alive.store(false, Ordering::Release);
-                        }
+                    if link.tx.send(frame.clone()).is_err() {
+                        link.alive.store(false, Ordering::Release);
+                    } else {
+                        link.strikes.store(0, Ordering::Release);
+                        return true;
                     }
                 } else {
                     link.skip_rounds.fetch_sub(1, Ordering::Release);
@@ -362,7 +340,7 @@ async fn run_tunnel_listener(
         info!(peer = %peer, port, pool_size = pool.links.lock().unwrap().len() + 1, "tunnel link accepted");
 
         let (rd, wr) = stream.into_split();
-        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHAN_CAP);
+        let (tx, rx) = mpsc::unbounded_channel::<Frame>();
         let link = Arc::new(TunnelLink {
             tx,
             alive: AtomicBool::new(true),
@@ -405,7 +383,7 @@ async fn run_tunnel_listener(
 const KEEPALIVE_INTERVAL_SECS: u64 = 12;
 
 async fn drain_frames(
-    mut rx: mpsc::Receiver<Frame>,
+    mut rx: mpsc::UnboundedReceiver<Frame>,
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     link: Arc<TunnelLink>,
 ) {
