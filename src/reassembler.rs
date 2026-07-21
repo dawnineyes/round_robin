@@ -1,6 +1,6 @@
 use crate::frame::{Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::socks5;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
@@ -14,8 +14,6 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 const UDP_CONN_ID: u32 = 0;
-/// If a tunnel receives no frames for this long, it is considered dead and reconnected.
-const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
 
 // ── Config ────────────────────────────────────────────────────────────
 
@@ -97,31 +95,26 @@ impl TunnelPool {
 
 /// Max out-of-order entries before we drop new arrivals.
 const MAX_PENDING_ENTRIES: usize = 256;
-/// If a gap persists this long, skip it and RST the connection.
-const GAP_TIMEOUT_SECS: u64 = 30;
 /// Max number of pending cids with DATA-before-SYN buffered.
 const MAX_PENDING_CIDS: usize = 256;
 
 struct ReorderBuf {
     expected: u64,
     pending: BTreeMap<u64, Bytes>,
-    gap_since: Option<Instant>,
 }
 
 impl ReorderBuf {
     fn new() -> Self {
-        Self { expected: 1, pending: BTreeMap::new(), gap_since: None }
+        Self { expected: 1, pending: BTreeMap::new() }
     }
 
-    /// Returns (in_order_chunks, gap_timeout).
-    /// `gap_timeout` means a persistent gap was skipped — callers should
-    /// RST the connection to force cleanup on both ends.
-    fn push(&mut self, seq: u64, payload: Bytes) -> (Vec<Bytes>, bool) {
+    /// Returns in-order chunks. Out-of-order frames are buffered until the gap fills.
+    /// TUIC TCP guarantees delivery — we just wait.
+    fn push(&mut self, seq: u64, payload: Bytes) -> Vec<Bytes> {
         let mut out = Vec::new();
-        let mut gap_timeout = false;
 
         if seq < self.expected {
-            return (out, false);
+            return out;
         }
         if seq == self.expected {
             out.push(payload);
@@ -130,29 +123,11 @@ impl ReorderBuf {
                 out.push(chunk);
                 self.expected = self.expected.wrapping_add(1);
             }
-            self.gap_since = None;
         } else if self.pending.len() < MAX_PENDING_ENTRIES {
             self.pending.insert(seq, payload);
-            if self.gap_since.is_none() {
-                self.gap_since = Some(Instant::now());
-            }
         }
 
-        // Gap timeout: skip the gap, signal RST — don't deliver dirty data
-        if let Some(start) = self.gap_since {
-            if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
-                // Advance expected past the gap so the connection can recover
-                // if the caller chooses not to RST.
-                if let Some(&max_seq) = self.pending.keys().last() {
-                    self.expected = max_seq.wrapping_add(1);
-                }
-                self.pending.clear();
-                self.gap_since = None;
-                gap_timeout = true;
-            }
-        }
-
-        (out, gap_timeout)
+        out
     }
 }
 
@@ -399,20 +374,9 @@ async fn tunnel_read_loop(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
-        // Adaptive timeout: short when connections are active, long when idle.
-        let timeout = if conns.is_empty() { 300 } else { TUNNEL_READ_TIMEOUT_SECS };
-        let frame = match tokio::time::timeout(
-            Duration::from_secs(timeout),
-            decoder.try_next(&mut rd),
-        )
-        .await
-        {
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Err(e)) => return Err(e),
-            Err(_elapsed) => {
-                bail!("tunnel read idle timeout after {timeout}s");
-            }
+        let frame = match decoder.try_next(&mut rd).await? {
+            Some(f) => f,
+            None => return Ok(()),
         };
         let plen = frame.payload.len() as u64;
         handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size, &udp_sock).await?;
@@ -504,11 +468,7 @@ async fn handle_frame(
         if let Some((_, entry)) = pending.remove(&cid) {
             for f in entry.frames {
                 if f.flags & FLAG_DATA != 0 {
-                    let (ready, gap_timeout) = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
-                    if gap_timeout {
-                        conns.remove(&cid);
-                        break;
-                    }
+                    let ready = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
                     for chunk in ready {
                         if !vconn.egress.write(&chunk) {
                             warn!(conn_id = cid, "egress write failed (drain)");
@@ -533,13 +493,7 @@ async fn handle_frame(
     if frame.flags & FLAG_DATA != 0 {
         if let Some(vconn) = conns.get(&cid) {
             let plen = frame.payload.len() as u64;
-            let (ready, gap_timeout) = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
-            if gap_timeout {
-                warn!(conn_id = cid, "reorder gap timeout → RST");
-                pool.send(Frame::rst(cid));
-                conns.remove(&cid);
-                return Ok(());
-            }
+            let ready = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
             for chunk in ready {
                 if !vconn.egress.write(&chunk) {
                     warn!(conn_id = cid, "egress write failed");

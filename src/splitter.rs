@@ -13,9 +13,6 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Consecutive channel-full results before cooling down a tunnel.
-/// If a tunnel receives no frames for this long, it is considered dead and reconnected.
-const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
 /// Reserved conn_id for UDP relay traffic.
 const UDP_CONN_ID: u32 = 0;
 
@@ -102,27 +99,24 @@ impl TunnelPool {
 
 /// Max out-of-order entries before we drop new arrivals.
 const MAX_PENDING_ENTRIES: usize = 256;
-/// If a gap persists this long, skip it and RST the connection.
-const GAP_TIMEOUT_SECS: u64 = 30;
 
 struct ReorderBuf {
     expected: u64,
     pending: BTreeMap<u64, Bytes>,
-    gap_since: Option<Instant>,
 }
 
 impl ReorderBuf {
     fn new() -> Self {
-        Self { expected: 1, pending: BTreeMap::new(), gap_since: None } // DATA seq starts at 1
+        Self { expected: 1, pending: BTreeMap::new() }
     }
 
-    /// Returns (in_order_chunks, gap_timeout).
-    fn push(&mut self, seq: u64, payload: Bytes) -> (Vec<Bytes>, bool) {
+    /// Returns in-order chunks. Out-of-order frames are buffered until the gap fills.
+    /// TUIC TCP guarantees delivery — we just wait.
+    fn push(&mut self, seq: u64, payload: Bytes) -> Vec<Bytes> {
         let mut out = Vec::new();
-        let mut gap_timeout = false;
 
         if seq < self.expected {
-            return (out, false); // duplicate
+            return out; // duplicate
         }
         if seq == self.expected {
             out.push(payload);
@@ -131,29 +125,11 @@ impl ReorderBuf {
                 out.push(chunk);
                 self.expected = self.expected.wrapping_add(1);
             }
-            self.gap_since = None;
         } else if self.pending.len() < MAX_PENDING_ENTRIES {
             self.pending.insert(seq, payload);
-            if self.gap_since.is_none() {
-                self.gap_since = Some(Instant::now());
-            }
         }
 
-        // Gap timeout: skip the gap, signal RST — don't deliver dirty data
-        if let Some(start) = self.gap_since {
-            if start.elapsed().as_secs() >= GAP_TIMEOUT_SECS && !self.pending.is_empty() {
-                // Advance expected past the gap so the connection can recover
-                // if the caller chooses not to RST.
-                if let Some(&max_seq) = self.pending.keys().last() {
-                    self.expected = max_seq.wrapping_add(1);
-                }
-                self.pending.clear();
-                self.gap_since = None;
-                gap_timeout = true;
-            }
-        }
-
-        (out, gap_timeout)
+        out
     }
 }
 
@@ -173,16 +149,14 @@ struct VirtConn {
 }
 
 impl VirtConn {
-    /// Returns true if a persistent gap just timed out — caller should RST.
-    fn on_frame(&self, seq: u64, payload: Bytes) -> bool {
+    fn on_frame(&self, seq: u64, payload: Bytes) {
         let plen = payload.len() as u64;
-        let (ready, gap_timeout) = self.reorder.lock().unwrap().push(seq, payload);
+        let ready = self.reorder.lock().unwrap().push(seq, payload);
         for chunk in ready {
             let _ = self.to_client_tx.send(chunk);
         }
         self.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         self.frames_recv.fetch_add(1, Ordering::Relaxed);
-        gap_timeout
     }
 }
 
@@ -361,21 +335,9 @@ async fn tunnel_read_loop(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
-        // Adaptive timeout: short when connections are active (need to
-        // detect dead tunnels), long when idle (avoid reconnect cycling).
-        let timeout = if conns.is_empty() { 300 } else { TUNNEL_READ_TIMEOUT_SECS };
-        let frame = match tokio::time::timeout(
-            Duration::from_secs(timeout),
-            decoder.try_next(&mut rd),
-        )
-        .await
-        {
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Err(e)) => return Err(e),
-            Err(_elapsed) => {
-                bail!("tunnel read idle timeout after {timeout}s");
-            }
+        let frame = match decoder.try_next(&mut rd).await? {
+            Some(f) => f,
+            None => return Ok(()),
         };
         let plen = frame.payload.len() as u64;
         handle_inbound_frame(frame, tunnel_idx, conns, pool);
@@ -396,13 +358,7 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool:
 
     if frame.flags & FLAG_DATA != 0 {
         if let Some(conn) = conns.get(&frame.conn_id) {
-            if conn.on_frame(frame.seq, frame.payload) {
-                // Reorder gap timeout — tear down the connection
-                conn.closed.store(true, Ordering::Release);
-                conn.notify.notify_one();
-                conns.remove(&frame.conn_id);
-                pool.send(Frame::rst(frame.conn_id));
-            }
+            conn.on_frame(frame.seq, frame.payload);
         } else {
             // Unknown conn_id: stale/dangling. Send RST so the
             // reassembler cleans up and stops flooding the tunnel.
