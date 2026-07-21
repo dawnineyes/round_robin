@@ -27,6 +27,13 @@ echo "Latest version: $TAG"
 if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
     echo "Stopping running service..."
     sudo systemctl stop "$SERVICE"
+    # Wait for the old process to actually die before downloading
+    for i in $(seq 1 30); do
+        if ! systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
 fi
 
 # ── Download binary ────────────────────────────────────────────────────
@@ -62,13 +69,10 @@ EOF
     sudo systemctl enable "$SERVICE"
 fi
 
-# ── Start service ──────────────────────────────────────────────────────
-
-echo "Starting service..."
-sudo systemctl start "$SERVICE"
+# ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
 echo "=== Done ==="
+echo "Binary: ${INSTALL_DIR}/${BINARY} (${TAG})"
 echo "Config: ${INSTALL_DIR}/config.toml"
-echo "Logs:   journalctl -u ${SERVICE} -f"
-echo "Status: sudo systemctl status ${SERVICE}"
+echo "Run:    sudo systemctl restart ${SERVICE}"

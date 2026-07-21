@@ -356,7 +356,11 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
 // ── Tunnel management ─────────────────────────────────────────────────
 
 async fn establish_tunnel(ep: &TunnelEndpoint) -> Result<TcpStream> {
-    let stream = socks5::socks5_client_connect(ep.proxy, &ep.target, ep.port).await?;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        socks5::socks5_client_connect(ep.proxy, &ep.target, ep.port),
+    )
+    .await??;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }

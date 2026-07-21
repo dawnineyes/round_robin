@@ -510,17 +510,22 @@ async fn handle_frame(
         let syn_target = SynTarget::decode(&frame.payload)?;
         info!(conn_id = cid, target = %syn_target.address, proto = syn_target.proto, "SYN");
 
-        // Connect to local_target via SOCKS5
-        let egress_stream = match socks5::socks5_client_connect(
-            local_target,
-            &syn_target.address,
-            syn_target.port,
+        // Connect to local_target via SOCKS5 (with timeout)
+        let egress_stream = match tokio::time::timeout(
+            Duration::from_secs(10),
+            socks5::socks5_client_connect(local_target, &syn_target.address, syn_target.port),
         )
         .await
         {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 warn!(conn_id = cid, target = %syn_target.address, error = %e, "egress connect failed");
+                pending.remove(&cid);
+                pool.send_via(Frame::rst(cid), src_port);
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(conn_id = cid, target = %syn_target.address, "egress connect timeout");
                 pending.remove(&cid);
                 pool.send_via(Frame::rst(cid), src_port);
                 return Ok(());
