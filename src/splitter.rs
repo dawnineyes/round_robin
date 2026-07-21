@@ -289,39 +289,18 @@ async fn establish_tunnel(ep: &TunnelEndpoint) -> Result<TcpStream> {
     Ok(stream)
 }
 
-/// Time between keepalive frames when the tunnel is idle.
-/// Must be well below sing-box's 25s SOCKS5 idle timeout.
-/// 12s gives 13s margin against transient TCP congestion delays.
-const KEEPALIVE_INTERVAL_SECS: u64 = 12;
-
 async fn drain_frames(
     mut rx: mpsc::UnboundedReceiver<Frame>,
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     link: Arc<TunnelLink>,
 ) {
-    let ka = Frame { conn_id: 0, seq: 0, flags: 0, payload: Bytes::new() };
-    let ka_bytes = ka.encode();
-    loop {
-        tokio::select! {
-            frame = rx.recv() => {
-                match frame {
-                    Some(frame) => {
-                        let n = frame.payload.len() as u64;
-                        if wr.write_all(&frame.encode()).await.is_err() {
-                            break;
-                        }
-                        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
-                        link.frames_sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                    None => break,
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)) => {
-                if wr.write_all(&ka_bytes).await.is_err() {
-                    break;
-                }
-            }
+    while let Some(frame) = rx.recv().await {
+        let n = frame.payload.len() as u64;
+        if wr.write_all(&frame.encode()).await.is_err() {
+            break;
         }
+        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        link.frames_sent.fetch_add(1, Ordering::Relaxed);
     }
     let _ = wr.shutdown().await;
 }
