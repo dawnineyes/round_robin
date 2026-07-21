@@ -1,4 +1,4 @@
-use crate::frame::{AckInfo, Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
+use crate::frame::{Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::socks5;
 use anyhow::{bail, Result};
 use bytes::Bytes;
@@ -16,10 +16,6 @@ use tracing::{error, info, warn};
 const TUNNEL_CHAN_CAP: usize = 64;
 const STRIKE_THRESHOLD: u32 = 3;
 const COOLDOWN_ROUNDS: u32 = 16;
-/// Send ACK to splitter every N bytes delivered.
-const ACK_INTERVAL_BYTES: u64 = 65536;
-/// Max bytes the reorder buffer can hold before we signal splitter to slow down.
-const MAX_REORDER_WINDOW: u32 = 262144;
 const UDP_CONN_ID: u32 = 0;
 /// If a tunnel receives no frames for this long, it is considered dead and reconnected.
 const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
@@ -223,8 +219,6 @@ impl EgressConn {
 struct VirtConnDe {
     egress: EgressConn,
     reorder: Mutex<ReorderBuf>,
-    delivered_bytes: AtomicU64,
-    last_acked: AtomicU64,
     created_at: Instant,
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
@@ -539,8 +533,6 @@ async fn handle_frame(
         let vconn = Arc::new(VirtConnDe {
             egress: EgressConn { write_tx },
             reorder: Mutex::new(ReorderBuf::new()),
-            delivered_bytes: AtomicU64::new(0),
-            last_acked: AtomicU64::new(0),
             created_at: Instant::now(),
             bytes_sent: AtomicU64::new(0),
             bytes_recv: AtomicU64::new(0),
@@ -560,7 +552,6 @@ async fn handle_frame(
 
         // Drain any frames that arrived during SOCKS5 connect
         if let Some((_, entry)) = pending.remove(&cid) {
-            let mut drained: u64 = 0;
             for f in entry.frames {
                 if f.flags & FLAG_DATA != 0 {
                     let (ready, gap_timeout) = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
@@ -569,7 +560,6 @@ async fn handle_frame(
                         break;
                     }
                     for chunk in ready {
-                        drained += chunk.len() as u64;
                         if !vconn.egress.write(&chunk) {
                             warn!(conn_id = cid, "egress write failed (drain)");
                             break;
@@ -579,9 +569,6 @@ async fn handle_frame(
                     info!(conn_id = cid, "FIN during SYN, cleaning up");
                     conns.remove(&cid);
                 }
-            }
-            if drained > 0 {
-                send_ack_if_needed(cid, &vconn, drained, pool);
             }
         }
 
@@ -603,9 +590,7 @@ async fn handle_frame(
                 conns.remove(&cid);
                 return Ok(());
             }
-            let mut delivered: u64 = 0;
             for chunk in ready {
-                delivered += chunk.len() as u64;
                 if !vconn.egress.write(&chunk) {
                     warn!(conn_id = cid, "egress write failed");
                     break;
@@ -613,9 +598,6 @@ async fn handle_frame(
             }
             vconn.bytes_recv.fetch_add(plen, Ordering::Relaxed);
             vconn.frames_recv.fetch_add(1, Ordering::Relaxed);
-            if delivered > 0 {
-                send_ack_if_needed(cid, &vconn, delivered, pool);
-            }
             return Ok(());
         }
         // Not in conns — could be pending (SYN still in flight) or
@@ -662,13 +644,8 @@ async fn handle_frame(
         return Ok(());
     }
 
-    // ACK (splitter → reassembler)
-    if frame.flags & FLAG_ACK != 0 {
-        if let Ok(ack) = AckInfo::decode(&frame.payload) {
-            // ponytail: ack tracking for egress send window (v2)
-            let _ = ack;
-        }
-    }
+    // ACK frames are ignored — TCP backpressure replaces application flow control.
+    let _ = frame.flags & FLAG_ACK;
 
     Ok(())
 }
@@ -679,19 +656,6 @@ async fn handle_udp_frame(frame: Frame, udp_sock: &UdpSocket) -> Result<()> {
     let (target, data) = socks5::decode_udp_datagram(&frame.payload)?;
     udp_sock.send_to(&data, (target.address.as_str(), target.port)).await?;
     Ok(())
-}
-
-// ── ACK helper ────────────────────────────────────────────────────────
-
-fn send_ack_if_needed(cid: u32, vconn: &VirtConnDe, delivered: u64, pool: &TunnelPool) {
-    let total = vconn.delivered_bytes.fetch_add(delivered, Ordering::AcqRel) + delivered;
-    let last = vconn.last_acked.load(Ordering::Acquire);
-    if total.saturating_sub(last) >= ACK_INTERVAL_BYTES {
-        let pending_est = vconn.reorder.lock().unwrap().pending.len() as u32 * 16384;
-        let window = MAX_REORDER_WINDOW.saturating_sub(pending_est);
-        let _ = pool.send(crate::frame::Frame::ack(cid, total, window));
-        vconn.last_acked.store(total, Ordering::Release);
-    }
 }
 
 // ── Egress I/O tasks ──────────────────────────────────────────────────
@@ -750,14 +714,6 @@ async fn read_from_egress(
                 warn!(conn_id, error = %e, "egress read error");
                 break;
             }
-        }
-    }
-    // Send final ACK so splitter knows exact delivery count for this conn
-    if let Some(vconn) = conns.get(&conn_id) {
-        let delivered = vconn.delivered_bytes.load(Ordering::Acquire);
-        let last_acked = vconn.last_acked.load(Ordering::Acquire);
-        if delivered > last_acked {
-            let _ = pool.send(Frame::ack(conn_id, delivered, 0));
         }
     }
     pool.send(Frame::fin(conn_id, seq));

@@ -1,11 +1,11 @@
-use crate::frame::{self, AckInfo, Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
+use crate::frame::{self, Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::socks5;
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,12 +19,8 @@ const TUNNEL_CHAN_CAP: usize = 64;
 const STRIKE_THRESHOLD: u32 = 3;
 /// Round-robin rounds to skip a degraded tunnel.
 const COOLDOWN_ROUNDS: u32 = 16;
-/// Initial send credit (bytes) before first ACK arrives.
-const INITIAL_CREDIT: i64 = 262144;
 /// If a tunnel receives no frames for this long, it is considered dead and reconnected.
 const TUNNEL_READ_TIMEOUT_SECS: u64 = 25;
-/// Max time to wait for credit (ACK) before closing connection as dead.
-const CREDIT_TIMEOUT_SECS: u64 = 15;
 /// Reserved conn_id for UDP relay traffic.
 const UDP_CONN_ID: u32 = 0;
 
@@ -194,8 +190,8 @@ impl ReorderBuf {
 struct VirtConn {
     to_client_tx: mpsc::UnboundedSender<Bytes>,
     reorder: Mutex<ReorderBuf>,
-    send_credit: AtomicI64,
-    ack_notify: tokio::sync::Notify,
+    /// Woken on FIN/RST so the client read loop can exit.
+    notify: tokio::sync::Notify,
     closed: AtomicBool,
     created_at: Instant,
     bytes_sent: AtomicU64,
@@ -215,21 +211,6 @@ impl VirtConn {
         self.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         self.frames_recv.fetch_add(1, Ordering::Relaxed);
         gap_timeout
-    }
-
-    fn on_ack(&self, ack_bytes: u64, window: u32) {
-        // ponytail: simple byte-count credit; seq-based tracking in v3
-        let credit = ack_bytes as i64 + window as i64;
-        self.send_credit.store(credit, Ordering::Release);
-        self.ack_notify.notify_one();
-    }
-
-    fn consume_credit(&self, n: usize) {
-        self.send_credit.fetch_sub(n as i64, Ordering::Release);
-    }
-
-    fn has_credit(&self) -> bool {
-        self.send_credit.load(Ordering::Acquire) > 0
     }
 }
 
@@ -449,7 +430,7 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool:
             if conn.on_frame(frame.seq, frame.payload) {
                 // Reorder gap timeout — tear down the connection
                 conn.closed.store(true, Ordering::Release);
-                conn.ack_notify.notify_one();
+                conn.notify.notify_one();
                 conns.remove(&frame.conn_id);
                 pool.send(Frame::rst(frame.conn_id));
             }
@@ -464,7 +445,7 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool:
     if frame.flags & FLAG_FIN != 0 {
         if let Some((_, conn)) = conns.remove(&frame.conn_id) {
             conn.closed.store(true, Ordering::Release);
-            conn.ack_notify.notify_one();
+            conn.notify.notify_one();
             drop(conn);
         }
         return;
@@ -473,19 +454,14 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool:
     if frame.flags & FLAG_RST != 0 {
         if let Some((_, conn)) = conns.remove(&frame.conn_id) {
             conn.closed.store(true, Ordering::Release);
-            conn.ack_notify.notify_one();
+            conn.notify.notify_one();
             drop(conn);
         }
         return;
     }
 
-    if frame.flags & FLAG_ACK != 0 {
-        if let Ok(ack) = AckInfo::decode(&frame.payload) {
-            if let Some(conn) = conns.get(&frame.conn_id) {
-                conn.on_ack(ack.ack_seq, ack.window);
-            }
-        }
-    }
+    // ACK frames are ignored — TCP backpressure replaces application flow control.
+    let _ = frame.flags & FLAG_ACK;
 }
 
 // ── Client handler ────────────────────────────────────────────────────
@@ -536,8 +512,7 @@ async fn handle_tcp_client(
     let vconn = Arc::new(VirtConn {
         to_client_tx,
         reorder: Mutex::new(ReorderBuf::new()),
-        send_credit: AtomicI64::new(INITIAL_CREDIT),
-        ack_notify: tokio::sync::Notify::new(),
+        notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         created_at: Instant::now(),
         bytes_sent: AtomicU64::new(0),
@@ -562,47 +537,8 @@ async fn handle_tcp_client(
 
     let mut buf = vec![0u8; chunk_size];
     let mut seq: u64 = 1;
-    let mut credit_exhausted = false;
     loop {
-        while !vconn.has_credit() {
-            if vconn.closed.load(Ordering::Acquire) {
-                break;
-            }
-            if !credit_exhausted {
-                info!(conn_id, "flow: credit exhausted, pausing");
-                credit_exhausted = true;
-            }
-            {
-                let notified = vconn.ack_notify.notified();
-                // Double-check: ACK may have arrived between has_credit()
-                // and notified() creation — Notify does not capture past events.
-                if vconn.has_credit() {
-                    break; // credit restored, no need to wait
-                }
-                match tokio::time::timeout(
-                    Duration::from_secs(CREDIT_TIMEOUT_SECS),
-                    notified,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(_) => {
-                        warn!(conn_id, timeout = CREDIT_TIMEOUT_SECS, "credit timeout, no ACK — closing");
-                        vconn.closed.store(true, Ordering::Release);
-                        break;
-                    }
-                }
-            }
-        }
-        if vconn.closed.load(Ordering::Acquire) {
-            break;
-        }
-        if credit_exhausted && vconn.has_credit() {
-            info!(conn_id, credit = vconn.send_credit.load(Ordering::Acquire), "flow: credit restored, resuming");
-            credit_exhausted = false;
-        }
-
-        // Race client read against close/ACK notifications.
+        // Race client read against close notification.
         // Without this, a FIN from the reassembler would leave us
         // stuck in read() while the browser holds the connection open
         // (HTTP keep-alive), and the hung connection keeps tunnels in
@@ -612,7 +548,6 @@ async fn handle_tcp_client(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        vconn.consume_credit(n);
                         let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
                         let mut sent = false;
                         for retry in 0..5 {
@@ -639,7 +574,7 @@ async fn handle_tcp_client(
                     }
                 }
             }
-            _ = vconn.ack_notify.notified() => {
+            _ = vconn.notify.notified() => {
                 if vconn.closed.load(Ordering::Acquire) {
                     break;
                 }
@@ -686,8 +621,7 @@ async fn handle_udp_client(
     let vconn = Arc::new(VirtConn {
         to_client_tx: to_udp_tx,
         reorder: Mutex::new(ReorderBuf::new()),
-        send_credit: AtomicI64::new(i64::MAX),
-        ack_notify: tokio::sync::Notify::new(),
+        notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         created_at: Instant::now(),
         bytes_sent: AtomicU64::new(0),
