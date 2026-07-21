@@ -5,7 +5,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,8 +31,6 @@ pub struct ReassemblerConfig {
 struct TunnelLink {
     tx: mpsc::UnboundedSender<Frame>,
     alive: AtomicBool,
-    strikes: AtomicU32,
-    skip_rounds: AtomicU32,
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
     frames_sent: AtomicU64,
@@ -69,27 +67,15 @@ impl TunnelPool {
             return false;
         }
         let start = self.rr.fetch_add(1, Ordering::Relaxed) % links.len();
-        let n = links.len();
-        for i in 0..n {
-            let idx = (start + i) % n;
-            let link = &links[idx];
+        for i in 0..links.len() {
+            let link = &links[(start + i) % links.len()];
             if !link.alive.load(Ordering::Acquire) {
                 continue;
             }
-            let skip = link.skip_rounds.load(Ordering::Acquire);
-            if skip > 0 {
-                link.skip_rounds.fetch_sub(1, Ordering::Release);
-                continue;
+            if link.tx.send(frame.clone()).is_ok() {
+                return true;
             }
-            match link.tx.send(frame.clone()) {
-                Ok(()) => {
-                    link.strikes.store(0, Ordering::Release);
-                    return true;
-                }
-                Err(_) => {
-                    link.alive.store(false, Ordering::Release);
-                }
-            }
+            link.alive.store(false, Ordering::Release);
         }
         false
     }
@@ -98,18 +84,8 @@ impl TunnelPool {
         let links = self.links.lock().unwrap();
         if src_link < links.len() {
             let link = &links[src_link];
-            if link.alive.load(Ordering::Acquire) {
-                let skip = link.skip_rounds.load(Ordering::Acquire);
-                if skip == 0 {
-                    if link.tx.send(frame.clone()).is_err() {
-                        link.alive.store(false, Ordering::Release);
-                    } else {
-                        link.strikes.store(0, Ordering::Release);
-                        return true;
-                    }
-                } else {
-                    link.skip_rounds.fetch_sub(1, Ordering::Release);
-                }
+            if link.alive.load(Ordering::Acquire) && link.tx.send(frame.clone()).is_ok() {
+                return true;
             }
         }
         drop(links);
@@ -286,7 +262,6 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             let links = hb_pool.links.lock().unwrap();
             let total = links.len();
             let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
-            let degraded = links.iter().filter(|l| l.skip_rounds.load(Ordering::Acquire) > 0).count();
             drop(links);
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
@@ -297,7 +272,6 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                 uptime,
                 alive,
                 total,
-                degraded,
                 active_conns = hb_conns.len(),
                 "heartbeat"
             );
@@ -344,8 +318,6 @@ async fn run_tunnel_listener(
         let link = Arc::new(TunnelLink {
             tx,
             alive: AtomicBool::new(true),
-            strikes: AtomicU32::new(0),
-            skip_rounds: AtomicU32::new(0),
             bytes_sent: AtomicU64::new(0),
             bytes_recv: AtomicU64::new(0),
             frames_sent: AtomicU64::new(0),

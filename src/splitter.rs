@@ -5,7 +5,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,8 +42,6 @@ pub struct TunnelEndpoint {
 struct TunnelLink {
     tx: mpsc::UnboundedSender<Frame>,
     alive: AtomicBool,
-    strikes: AtomicU32,
-    skip_rounds: AtomicU32,
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
     frames_sent: AtomicU64,
@@ -78,35 +76,22 @@ impl TunnelPool {
         }
     }
 
-    /// Round-robin send. Skips full channels and degraded tunnels.
+    /// Round-robin send. Unbounded sender — only fails if link is dead.
     fn send(&self, frame: Frame) -> bool {
         let links = self.links.lock().unwrap();
         if links.is_empty() {
             return false;
         }
         let start = self.rr.fetch_add(1, Ordering::Relaxed) % links.len();
-        let n = links.len();
-        for i in 0..n {
-            let idx = (start + i) % n;
-            let link = &links[idx];
+        for i in 0..links.len() {
+            let link = &links[(start + i) % links.len()];
             if !link.alive.load(Ordering::Acquire) {
                 continue;
             }
-            // Cool-down: skip degraded tunnels, decrement counter
-            let skip = link.skip_rounds.load(Ordering::Acquire);
-            if skip > 0 {
-                link.skip_rounds.fetch_sub(1, Ordering::Release);
-                continue;
+            if link.tx.send(frame.clone()).is_ok() {
+                return true;
             }
-            match link.tx.send(frame.clone()) {
-                Ok(()) => {
-                    link.strikes.store(0, Ordering::Release);
-                    return true;
-                }
-                Err(_) => {
-                    link.alive.store(false, Ordering::Release);
-                }
-            }
+            link.alive.store(false, Ordering::Release);
         }
         false
     }
@@ -226,8 +211,6 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                         let link = Arc::new(TunnelLink {
                             tx,
                             alive: AtomicBool::new(true),
-                            strikes: AtomicU32::new(0),
-                            skip_rounds: AtomicU32::new(0),
                             bytes_sent: AtomicU64::new(0),
                             bytes_recv: AtomicU64::new(0),
                             frames_sent: AtomicU64::new(0),
@@ -282,7 +265,6 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
             let links = hb_pool.links.lock().unwrap();
             let total = links.len();
             let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
-            let degraded = links.iter().filter(|l| l.skip_rounds.load(Ordering::Acquire) > 0).count();
             drop(links);
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
@@ -291,7 +273,6 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 uptime,
                 alive,
                 total,
-                degraded,
                 active_conns = hb_conns.len(),
                 udp_sent = hb_udp_sent.swap(0, Ordering::Relaxed),
                 udp_recv = hb_udp_recv.swap(0, Ordering::Relaxed),
@@ -302,12 +283,13 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
 
     // 2. Accept SOCKS5 clients
     let listener = TcpListener::bind(cfg.listen_addr).await?;
-    let next_conn_id = AtomicU64::new(1); // ponytail: u64 atomic, truncate to u32 for ConnID
+    let mut next_conn_id: u64 = 1;
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
-        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed) as u32;
+        let conn_id = next_conn_id as u32;
+        next_conn_id += 1;
         let pool = pool.clone();
         let conns = conns.clone();
         let us = udp_sent.clone();
@@ -536,18 +518,7 @@ async fn handle_tcp_client(
                     Ok(0) => break,
                     Ok(n) => {
                         let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
-                        let mut sent = false;
-                        for retry in 0..5 {
-                            if pool.send(frame.clone()) {
-                                sent = true;
-                                break;
-                            }
-                            if retry == 0 {
-                                warn!(conn_id, "egress backpressure, retrying");
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                        if !sent {
+                        if !pool.send(frame) {
                             warn!(conn_id, "no live tunnels, aborting");
                             break;
                         }
@@ -565,7 +536,7 @@ async fn handle_tcp_client(
                 if vconn.closed.load(Ordering::Acquire) {
                     break;
                 }
-                // Credit or other update — loop back to recheck state
+                // FIN/RST notification — loop back to check closed flag
             }
         }
     }
