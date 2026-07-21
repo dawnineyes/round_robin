@@ -1,8 +1,9 @@
 # 多路径 SOCKS5 负载均衡 — 技术设计文档
 
-> **⚠️ 本文档为 v1.6 时期设计，v1.8.1 已大幅简化。**
+> **⚠️ 本文档为 v1.6 时期设计，v1.9.0 已大幅简化。**
 > 已移除：ACK/credit 流控、strike/cooldown 降级、gap timeout、tunnel timeout、keepalive、重传、拥塞控制。
-> 当前设计原则：TUIC TCP 保证送达 → 只做 seq 重排。详见 git log v1.7.0 ~ v1.8.1。
+> v1.9.0: 修复背压机制（Notify 替代 yield_now busy-loop）、BytesMut 零拷贝、SOCKS5 栈缓冲+超时。
+> 当前设计原则：TUIC TCP 保证送达 → 只做 seq 重排。详见 git log v1.7.0 ~ v1.9.0。
 >
 > 版本: v1.6 (历史)  
 > 日期: 2026-07-21

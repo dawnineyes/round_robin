@@ -1,7 +1,7 @@
 use crate::frame::{Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::socks5;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -38,15 +38,17 @@ struct TunnelLink {
 struct TunnelPool {
     links: Mutex<Vec<Arc<TunnelLink>>>,
     rr: AtomicUsize,
+    notify: tokio::sync::Notify,
 }
 
 impl TunnelPool {
     fn new() -> Self {
-        Self { links: Mutex::new(Vec::new()), rr: AtomicUsize::new(0) }
+        Self { links: Mutex::new(Vec::new()), rr: AtomicUsize::new(0), notify: tokio::sync::Notify::new() }
     }
 
     fn add(&self, link: Arc<TunnelLink>) {
         self.links.lock().unwrap().push(link);
+        self.notify.notify_one();
     }
 
     /// Remove dead links from the pool. Called periodically from heartbeat.
@@ -186,10 +188,10 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let udp = udp_sock.clone();
         let pool = pool.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
+            let mut buf = BytesMut::zeroed(65535);
             let mut udp_seq: u64 = 1;
             loop {
-                match udp.recv_from(&mut buf).await {
+                match udp.recv_from(&mut buf[..]).await {
                     Ok((n, src)) => {
                         // Wrap in SOCKS5 UDP response header
                         let src_target = socks5::TargetAddr {
@@ -197,6 +199,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                             port: src.port(),
                         };
                         let dgram = socks5::encode_udp_datagram(&src_target, &buf[..n]);
+                        buf.resize(65535, 0);
                         let frame = Frame::data(UDP_CONN_ID, udp_seq, dgram);
                         udp_seq = udp_seq.wrapping_add(1);
                         pool.send(frame);
@@ -278,12 +281,10 @@ async fn run_tunnel_listener(
 
         // SOCKS5 handshake: sing-box SOCKS5 outbound CONNECTs here.
         // Accept any no-auth client, ignore the CONNECT target.
-        let stream = match socks5::socks5_accept_tunnel(stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(peer = %peer, error = %e, "SOCKS5 handshake failed");
-                continue;
-            }
+        let stream = match tokio::time::timeout(Duration::from_secs(10), socks5::socks5_accept_tunnel(stream)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => { warn!(peer = %peer, error = %e, "SOCKS5 handshake failed"); continue; }
+            Err(_) => { warn!(peer = %peer, "SOCKS5 handshake timeout"); continue; }
         };
 
         info!(peer = %peer, port, pool_size = pool.links.lock().unwrap().len() + 1, "tunnel link accepted");
@@ -562,29 +563,29 @@ async fn read_from_egress(
     pool: Arc<TunnelPool>,
     chunk_size: usize,
 ) {
-    let mut buf = vec![0u8; chunk_size];
+    let mut buf = BytesMut::zeroed(chunk_size);
     let mut seq: u64 = 1;
     loop {
-        match rd.read(&mut buf).await {
+        match rd.read(&mut buf[..]).await {
             Ok(0) => break,
             Ok(n) => {
-                let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
-                // Backpressure: if all tunnel channels are momentarily full,
-                // yield and retry instead of killing the connection.
-                let mut sent = false;
-                for retry in 0..5 {
-                    if pool.send(frame.clone()) {
-                        sent = true;
-                        break;
+                let frame = Frame::data(conn_id, seq, buf.split_to(n).freeze());
+                buf.resize(chunk_size, 0);
+                // Backpressure: if all tunnel channels are full, wait for a
+                // link reconnect notification (see TunnelPool::add).
+                if !pool.send(frame.clone()) {
+                    match tokio::time::timeout(Duration::from_secs(5), pool.notify.notified()).await {
+                        Ok(()) => {
+                            if !pool.send(frame.clone()) {
+                                warn!(conn_id, "no live tunnels for egress response");
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            warn!(conn_id, "no live tunnels for egress response after timeout");
+                            break;
+                        }
                     }
-                    if retry == 0 {
-                        warn!(conn_id, "egress backpressure, retrying");
-                    }
-                    tokio::task::yield_now().await;
-                }
-                if !sent {
-                    warn!(conn_id, "no live tunnels for egress response after retries");
-                    break;
                 }
                 // Count on the VirtConnDe
                 if let Some(vconn) = conns.get(&conn_id) {

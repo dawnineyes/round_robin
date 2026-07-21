@@ -48,13 +48,9 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result>
         bail!("not SOCKS5 (version {})", hdr[0]);
     }
     let nmethods = hdr[1] as usize;
-    let mut methods = vec![0u8; nmethods.min(16)];
-    stream.read_exact(&mut methods).await?;
-    if nmethods > 16 {
-        let mut drain = vec![0u8; nmethods - 16];
-        stream.read_exact(&mut drain).await?;
-    }
-    if !methods.contains(&AUTH_NONE) {
+    let mut methods = [0u8; 256];
+    stream.read_exact(&mut methods[..nmethods]).await?;
+    if !methods[..nmethods].contains(&AUTH_NONE) {
         stream.write_all(&[SOCKS_VERSION, 0xFF]).await?;
         bail!("client requires auth, only no-auth supported");
     }
@@ -120,13 +116,9 @@ pub async fn socks5_accept_tunnel(mut stream: TcpStream) -> Result<TcpStream> {
         bail!("not SOCKS5 (version {})", hdr[0]);
     }
     let nmethods = hdr[1] as usize;
-    let mut methods = vec![0u8; nmethods.min(16)];
-    stream.read_exact(&mut methods).await?;
-    if nmethods > 16 {
-        let mut drain = vec![0u8; nmethods - 16];
-        stream.read_exact(&mut drain).await?;
-    }
-    if !methods.contains(&AUTH_NONE) {
+    let mut methods = [0u8; 256];
+    stream.read_exact(&mut methods[..nmethods]).await?;
+    if !methods[..nmethods].contains(&AUTH_NONE) {
         stream.write_all(&[SOCKS_VERSION, 0xFF]).await?;
         bail!("tunnel requires auth, only no-auth supported");
     }

@@ -1,7 +1,7 @@
 use crate::frame::{self, Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
 use crate::socks5;
 use anyhow::{bail, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -383,7 +383,7 @@ async fn handle_client(
     udp_sent: Arc<AtomicU64>,
     udp_recv: Arc<AtomicU64>,
 ) -> Result<()> {
-    let accepted = socks5::socks5_server_accept(stream).await?;
+    let accepted = tokio::time::timeout(Duration::from_secs(10), socks5::socks5_server_accept(stream)).await??;
     match accepted {
         socks5::Socks5Result::Connect(accepted) => {
             handle_tcp_client(conn_id, accepted, peer, pool, conns, chunk_size).await
@@ -442,7 +442,7 @@ async fn handle_tcp_client(
         let _ = client_writer.shutdown().await;
     });
 
-    let mut buf = vec![0u8; chunk_size];
+    let mut buf = BytesMut::zeroed(chunk_size);
     let mut seq: u64 = 1;
     loop {
         // Race client read against close notification.
@@ -451,11 +451,12 @@ async fn handle_tcp_client(
         // (HTTP keep-alive), and the hung connection keeps tunnels in
         // short-timeout mode, causing tunnel cycling.
         tokio::select! {
-            result = client_reader.read(&mut buf) => {
+            result = client_reader.read(&mut buf[..]) => {
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
+                        let frame = Frame::data(conn_id, seq, buf.split_to(n).freeze());
+                        buf.resize(chunk_size, 0);
                         if !pool.send(frame) {
                             warn!(conn_id, "no live tunnels, aborting");
                             break;
@@ -555,15 +556,16 @@ async fn handle_udp_client(
         let _ = ka_tx.send(());
     });
 
-    let mut buf = vec![0u8; 65535];
+    let mut buf = BytesMut::zeroed(65535);
     let mut seq: u64 = 1;
     loop {
         tokio::select! {
-            result = relay.recv_from(&mut buf) => {
+            result = relay.recv_from(&mut buf[..]) => {
                 let (n, client) = result?;
                 *client_addr.lock().unwrap() = Some(client);
                 udp_sent.fetch_add(1, Ordering::Relaxed);
-                let frame = Frame::data(UDP_CONN_ID, seq, Bytes::copy_from_slice(&buf[..n]));
+                let frame = Frame::data(UDP_CONN_ID, seq, buf.split_to(n).freeze());
+                buf.resize(65535, 0);
                 if !pool.send(frame) {
                     warn!("UDP relay: no live tunnels");
                     break;

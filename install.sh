@@ -7,20 +7,25 @@ BINARY="round_robin"
 SERVICE="round_robin"
 SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
 
+VERSION="${1:-latest}"
+
 echo "=== round_robin installer ==="
 
-# ── Fetch latest release ───────────────────────────────────────────────
+# ── Determine version ──────────────────────────────────────────────────
 
-echo "Fetching latest release..."
-RELEASE=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest")
-TAG=$(echo "$RELEASE" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)".*/\1/')
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${BINARY}"
-
-if [ -z "$TAG" ]; then
-    echo "ERROR: failed to fetch latest release"
-    exit 1
+if [ "$VERSION" = "latest" ]; then
+    echo "Fetching latest release..."
+    RELEASE=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest")
+    TAG=$(echo "$RELEASE" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    if [ -z "$TAG" ]; then
+        echo "ERROR: failed to fetch latest release"
+        exit 1
+    fi
+else
+    TAG="$VERSION"
 fi
-echo "Latest version: $TAG"
+echo "Version: $TAG"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${BINARY}"
 
 # ── Stop running service ───────────────────────────────────────────────
 
