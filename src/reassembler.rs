@@ -94,7 +94,7 @@ impl TunnelPool {
 // ── Reorder buffer ────────────────────────────────────────────────────
 
 /// Max out-of-order entries before we drop new arrivals.
-const MAX_PENDING_ENTRIES: usize = 256;
+const MAX_PENDING_ENTRIES: usize = 512;
 /// Max number of pending cids with DATA-before-SYN buffered.
 const MAX_PENDING_CIDS: usize = 256;
 

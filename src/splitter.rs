@@ -98,7 +98,10 @@ impl TunnelPool {
 // ── Reorder buffer ────────────────────────────────────────────────────
 
 /// Max out-of-order entries before we drop new arrivals.
-const MAX_PENDING_ENTRIES: usize = 256;
+/// At 65535 byte chunks, 512 entries = 32 MB reorder window.
+/// Overflow with a warning — the gap will eventually fill when
+/// the slow tunnel catches up.
+const MAX_PENDING_ENTRIES: usize = 512;
 
 struct ReorderBuf {
     expected: u64,
