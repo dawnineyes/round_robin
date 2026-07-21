@@ -6,7 +6,7 @@ log = true                        # 日滚动日志，默认 true；false 关闭
 
 [splitter]
 listen = "127.0.0.1:52030"
-# chunk_size = 16384           # 分片大小 (512-65535)，默认 16384
+# chunk_size = 65535           # 分片大小 (512-65535)，默认 65535
 
 [[splitter.tunnel]]
 proxy = "127.0.0.1:52031"

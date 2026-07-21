@@ -72,7 +72,7 @@ struct Tunnel {
 }
 
 fn default_chunk() -> usize {
-    16384
+    65535
 }
 
 fn default_splitter_listen() -> SocketAddr {

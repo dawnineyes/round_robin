@@ -57,7 +57,7 @@ local_target = "127.0.0.1:52035"
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `listen` | SocketAddr | SOCKS5 入站地址 |
-| `chunk_size` | usize | 分片大小 512-65535，默认 16384 |
+| `chunk_size` | usize | 分片大小 512-65535，默认 65535 |
 | `[[splitter.tunnel]]` | array | 隧道列表 |
 | `tunnel.proxy` | SocketAddr | sing-box SOCKS5 入站地址 |
 | `tunnel.target` | String | Reassembler IP |
