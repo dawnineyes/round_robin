@@ -105,6 +105,12 @@ pub fn purge_old_logs(dir: &Path, prefix: &str, keep_days: u64) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(keep_days * 86400));
     let Some(cutoff) = cutoff else { return };
+    let cutoff_days = cutoff
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        / 86400;
+    let cutoff_date = days_to_civil(cutoff_days);
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -118,18 +124,9 @@ pub fn purge_old_logs(dir: &Path, prefix: &str, keep_days: u64) {
             continue;
         }
         let date = &date_part[1..];
-        if date.len() != 10
-            || date.as_bytes().get(4) != Some(&b'-')
-            || date.as_bytes().get(7) != Some(&b'-')
-        {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(mod_time) = meta.modified() {
-                if mod_time < cutoff {
-                    let _ = fs::remove_file(&path);
-                }
-            }
+        // YYYY-MM-DD lexicographic order == chronological order
+        if date < cutoff_date.as_str() {
+            let _ = fs::remove_file(&path);
         }
     }
 }

@@ -1,4 +1,6 @@
-use crate::frame::{Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
+use crate::frame::{
+    FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, SynTarget,
+};
 use crate::socks5;
 use anyhow::Result;
 use bytes::Bytes;
@@ -10,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
 const UDP_CONN_ID: u32 = 0;
@@ -42,7 +44,10 @@ struct TunnelPool {
 
 impl TunnelPool {
     fn new() -> Self {
-        Self { links: Mutex::new(Vec::new()), rr: AtomicUsize::new(0) }
+        Self {
+            links: Mutex::new(Vec::new()),
+            rr: AtomicUsize::new(0),
+        }
     }
 
     fn add(&self, link: Arc<TunnelLink>) {
@@ -105,7 +110,10 @@ struct ReorderBuf {
 
 impl ReorderBuf {
     fn new() -> Self {
-        Self { expected: 1, pending: BTreeMap::new() }
+        Self {
+            expected: 1,
+            pending: BTreeMap::new(),
+        }
     }
 
     /// Returns in-order chunks. Out-of-order frames are buffered until the gap fills.
@@ -148,6 +156,7 @@ impl EgressConn {
 struct VirtConnDe {
     egress: EgressConn,
     reorder: Mutex<ReorderBuf>,
+    cancel: Arc<Notify>,
     created_at: Instant,
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
@@ -196,10 +205,18 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                             address: src.ip().to_string(),
                             port: src.port(),
                         };
-                        let dgram = socks5::encode_udp_datagram(&src_target, &buf[..n]);
+                        let dgram = match socks5::encode_udp_datagram(&src_target, &buf[..n]) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(error = %e, "UDP encode failed");
+                                continue;
+                            }
+                        };
                         let frame = Frame::data(UDP_CONN_ID, udp_seq, dgram);
                         udp_seq = udp_seq.wrapping_add(1);
-                        pool.send(frame);
+                        if !pool.send(frame) {
+                            warn!("UDP relay: no live tunnels, dropping response datagram");
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "UDP relay recv error");
@@ -218,7 +235,18 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let listen_ip = cfg.listen_ip;
         let udp = udp_sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_tunnel_listener(listen_ip, port, local_target, conns, pending, pool, cfg.chunk_size, udp).await {
+            if let Err(e) = run_tunnel_listener(
+                listen_ip,
+                port,
+                local_target,
+                conns,
+                pending,
+                pool,
+                cfg.chunk_size,
+                udp,
+            )
+            .await
+            {
                 error!(port, error = %e, "listener died");
             }
         });
@@ -236,7 +264,10 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let links = hb_pool.links.lock().unwrap();
             let total = links.len();
-            let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
+            let alive = links
+                .iter()
+                .filter(|l| l.alive.load(Ordering::Acquire))
+                .count();
             drop(links);
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
@@ -310,16 +341,30 @@ async fn run_tunnel_listener(
         let udp = udp_sock.clone();
         let link2 = link.clone();
         tokio::spawn(async move {
-            if let Err(e) = tunnel_read_loop(rd, conns, pending, pool, local_target, port as usize, chunk_size, udp, &link2).await {
+            if let Err(e) = tunnel_read_loop(
+                rd,
+                conns,
+                pending,
+                pool,
+                local_target,
+                port as usize,
+                chunk_size,
+                udp,
+                &link2,
+            )
+            .await
+            {
                 warn!(tunnel = port, error = %e, "read loop ended");
             }
             link2.alive.store(false, Ordering::Release);
-            info!(tunnel = port,
+            info!(
+                tunnel = port,
                 bytes_sent = link2.bytes_sent.load(Ordering::Relaxed),
                 bytes_recv = link2.bytes_recv.load(Ordering::Relaxed),
                 frames_sent = link2.frames_sent.load(Ordering::Relaxed),
                 frames_recv = link2.frames_recv.load(Ordering::Relaxed),
-                "disconnected");
+                "disconnected"
+            );
         });
     }
 }
@@ -358,7 +403,17 @@ async fn tunnel_read_loop(
             None => return Ok(()),
         };
         let plen = frame.payload.len() as u64;
-        handle_frame(frame, &conns, &pending, &pool, local_target, src_port, chunk_size, &udp_sock).await?;
+        handle_frame(
+            frame,
+            &conns,
+            &pending,
+            &pool,
+            local_target,
+            src_port,
+            chunk_size,
+            &udp_sock,
+        )
+        .await?;
         link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         link.frames_recv.fetch_add(1, Ordering::Relaxed);
     }
@@ -380,7 +435,12 @@ async fn handle_frame(
 
     // UDP relay: conn_id 0, DATA → send to target
     if cid == UDP_CONN_ID && frame.flags & FLAG_DATA != 0 {
-        return handle_udp_frame(frame, udp_sock).await;
+        handle_udp_frame(frame, udp_sock).await;
+        return Ok(());
+    }
+    // Ignore any non-DATA frames for UDP_CONN_ID (SYN/FIN/RST not applicable)
+    if cid == UDP_CONN_ID {
+        return Ok(());
     }
 
     // SYN: new virtual connection
@@ -394,7 +454,15 @@ async fn handle_frame(
         });
 
         // Parse target from SYN payload
-        let syn_target = SynTarget::decode(&frame.payload)?;
+        let syn_target = match SynTarget::decode(&frame.payload) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(conn_id = cid, error = %e, "SYN decode failed");
+                pending.remove(&cid);
+                pool.send_via(Frame::rst(cid), src_port);
+                return Ok(());
+            }
+        };
         info!(conn_id = cid, target = %syn_target.address, proto = syn_target.proto, "SYN");
 
         // Connect to local_target via SOCKS5 (with timeout)
@@ -422,10 +490,12 @@ async fn handle_frame(
 
         let (egress_rd, egress_wr) = egress_stream.into_split();
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Bytes>();
+        let cancel = Arc::new(Notify::new());
 
         let vconn = Arc::new(VirtConnDe {
             egress: EgressConn { write_tx },
             reorder: Mutex::new(ReorderBuf::new()),
+            cancel: cancel.clone(),
             created_at: Instant::now(),
             bytes_sent: AtomicU64::new(0),
             bytes_recv: AtomicU64::new(0),
@@ -439,7 +509,14 @@ async fn handle_frame(
         // Spawn egress reader: egress response → frames → pool
         let conns_clone = conns.clone();
         let pool_clone = Arc::clone(pool);
-        tokio::spawn(read_from_egress(cid, egress_rd, conns_clone, pool_clone, chunk_size));
+        tokio::spawn(read_from_egress(
+            cid,
+            egress_rd,
+            conns_clone,
+            pool_clone,
+            chunk_size,
+            cancel,
+        ));
 
         conns.insert(cid, vconn.clone());
 
@@ -456,6 +533,7 @@ async fn handle_frame(
                     }
                 } else if f.flags & FLAG_FIN != 0 {
                     info!(conn_id = cid, "FIN during SYN, cleaning up");
+                    vconn.cancel.notify_one();
                     conns.remove(&cid);
                 }
             }
@@ -491,13 +569,20 @@ async fn handle_frame(
             if entry.frames.len() < MAX_PENDING_FRAMES_PER_CID {
                 entry.frames.push(frame);
             } else {
-                warn!(conn_id = cid, count = entry.frames.len(), "pending overflow, dropping DATA");
+                warn!(
+                    conn_id = cid,
+                    count = entry.frames.len(),
+                    "pending overflow, dropping DATA"
+                );
             }
         } else if pending.len() < MAX_PENDING_CIDS {
-            pending.insert(cid, PendingEntry {
-                frames: vec![frame],
-                since: Instant::now(),
-            });
+            pending.insert(
+                cid,
+                PendingEntry {
+                    frames: vec![frame],
+                    since: Instant::now(),
+                },
+            );
         }
         return Ok(());
     }
@@ -505,14 +590,17 @@ async fn handle_frame(
     // FIN
     if frame.flags & FLAG_FIN != 0 {
         if let Some((_, vconn)) = conns.remove(&cid) {
+            vconn.cancel.notify_one();
             let dur = vconn.created_at.elapsed().as_millis() as u64;
-            info!(conn_id = cid,
+            info!(
+                conn_id = cid,
                 bytes_sent = vconn.bytes_sent.load(Ordering::Relaxed),
                 bytes_recv = vconn.bytes_recv.load(Ordering::Relaxed),
                 frames_sent = vconn.frames_sent.load(Ordering::Relaxed),
                 frames_recv = vconn.frames_recv.load(Ordering::Relaxed),
                 duration_ms = dur,
-                "FIN, closed");
+                "FIN, closed"
+            );
             drop(vconn);
         }
         return Ok(());
@@ -521,6 +609,7 @@ async fn handle_frame(
     // RST
     if frame.flags & FLAG_RST != 0 {
         if let Some((_, vconn)) = conns.remove(&cid) {
+            vconn.cancel.notify_one();
             info!(conn_id = cid, "RST, force close");
             drop(vconn);
         }
@@ -535,10 +624,20 @@ async fn handle_frame(
 
 // ── UDP relay handler ─────────────────────────────────────────────────
 
-async fn handle_udp_frame(frame: Frame, udp_sock: &UdpSocket) -> Result<()> {
-    let (target, data) = socks5::decode_udp_datagram(&frame.payload)?;
-    udp_sock.send_to(&data, (target.address.as_str(), target.port)).await?;
-    Ok(())
+async fn handle_udp_frame(frame: Frame, udp_sock: &UdpSocket) {
+    let (target, data) = match socks5::decode_udp_datagram(&frame.payload) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "UDP datagram decode failed");
+            return;
+        }
+    };
+    if let Err(e) = udp_sock
+        .send_to(&data, (target.address.as_str(), target.port))
+        .await
+    {
+        warn!(error = %e, target = %target.address, port = target.port, "UDP send_to failed");
+    }
 }
 
 // ── Egress I/O tasks ──────────────────────────────────────────────────
@@ -561,53 +660,67 @@ async fn read_from_egress(
     conns: ConnMap,
     pool: Arc<TunnelPool>,
     chunk_size: usize,
+    cancel: Arc<Notify>,
 ) {
     let mut buf = vec![0u8; chunk_size];
     let mut seq: u64 = 1;
+    let mut cancelled = false;
     loop {
-        match rd.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
-                // Backpressure: if all tunnel channels are momentarily full,
-                // yield and retry instead of killing the connection.
-                let mut sent = false;
-                for retry in 0..5 {
-                    if pool.send(frame.clone()) {
-                        sent = true;
+        tokio::select! {
+            _ = cancel.notified() => {
+                cancelled = true;
+                break;
+            }
+            result = rd.read(&mut buf) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
+                        // Backpressure: if all tunnel channels are momentarily full,
+                        // yield and retry instead of killing the connection.
+                        let mut sent = false;
+                        for retry in 0..5 {
+                            if pool.send(frame.clone()) {
+                                sent = true;
+                                break;
+                            }
+                            if retry == 0 {
+                                warn!(conn_id, "egress backpressure, retrying");
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        if !sent {
+                            warn!(conn_id, "no live tunnels for egress response after retries");
+                            break;
+                        }
+                        // Count on the VirtConnDe
+                        if let Some(vconn) = conns.get(&conn_id) {
+                            vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                            vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        seq += 1;
+                    }
+                    Err(e) => {
+                        warn!(conn_id, error = %e, "egress read error");
                         break;
                     }
-                    if retry == 0 {
-                        warn!(conn_id, "egress backpressure, retrying");
-                    }
-                    tokio::task::yield_now().await;
                 }
-                if !sent {
-                    warn!(conn_id, "no live tunnels for egress response after retries");
-                    break;
-                }
-                // Count on the VirtConnDe
-                if let Some(vconn) = conns.get(&conn_id) {
-                    vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                    vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
-                }
-                seq += 1;
-            }
-            Err(e) => {
-                warn!(conn_id, error = %e, "egress read error");
-                break;
             }
         }
     }
-    pool.send(Frame::fin(conn_id, seq));
-    if let Some((_, vconn)) = conns.remove(&conn_id) {
-        let dur = vconn.created_at.elapsed().as_millis() as u64;
-        info!(conn_id,
-            bytes_sent = vconn.bytes_sent.load(Ordering::Relaxed),
-            bytes_recv = vconn.bytes_recv.load(Ordering::Relaxed),
-            frames_sent = vconn.frames_sent.load(Ordering::Relaxed),
-            frames_recv = vconn.frames_recv.load(Ordering::Relaxed),
-            duration_ms = dur,
-            "closed");
+    if !cancelled {
+        pool.send(Frame::fin(conn_id, seq));
+        if let Some((_, vconn)) = conns.remove(&conn_id) {
+            let dur = vconn.created_at.elapsed().as_millis() as u64;
+            info!(
+                conn_id,
+                bytes_sent = vconn.bytes_sent.load(Ordering::Relaxed),
+                bytes_recv = vconn.bytes_recv.load(Ordering::Relaxed),
+                frames_sent = vconn.frames_sent.load(Ordering::Relaxed),
+                frames_recv = vconn.frames_recv.load(Ordering::Relaxed),
+                duration_ms = dur,
+                "closed"
+            );
+        }
     }
 }

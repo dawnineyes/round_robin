@@ -1,6 +1,8 @@
-use crate::frame::{self, Frame, FrameDecoder, SynTarget, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN};
+use crate::frame::{
+    self, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, SynTarget,
+};
 use crate::socks5;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
@@ -52,7 +54,10 @@ struct TunnelPool {
 
 impl TunnelPool {
     fn new() -> Self {
-        Self { links: Mutex::new(Vec::new()), rr: AtomicUsize::new(0) }
+        Self {
+            links: Mutex::new(Vec::new()),
+            rr: AtomicUsize::new(0),
+        }
     }
 
     fn add(&self, link: Arc<TunnelLink>) {
@@ -92,7 +97,6 @@ impl TunnelPool {
         }
         false
     }
-
 }
 
 // ── Reorder buffer ────────────────────────────────────────────────────
@@ -110,7 +114,10 @@ struct ReorderBuf {
 
 impl ReorderBuf {
     fn new() -> Self {
-        Self { expected: 1, pending: BTreeMap::new() }
+        Self {
+            expected: 1,
+            pending: BTreeMap::new(),
+        }
     }
 
     /// Returns in-order chunks. Out-of-order frames are buffered until the gap fills.
@@ -203,12 +210,14 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                         link.alive.store(false, Ordering::Release);
                         wr_task.abort();
                         // Log disconnect summary
-                        info!(tunnel = i,
+                        info!(
+                            tunnel = i,
                             bytes_sent = link.bytes_sent.load(Ordering::Relaxed),
                             bytes_recv = link.bytes_recv.load(Ordering::Relaxed),
                             frames_sent = link.frames_sent.load(Ordering::Relaxed),
                             frames_recv = link.frames_recv.load(Ordering::Relaxed),
-                            "disconnected");
+                            "disconnected"
+                        );
                     }
                     Err(e) => {
                         retry_count += 1;
@@ -241,10 +250,15 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let links = hb_pool.links.lock().unwrap();
             let total = links.len();
-            let alive = links.iter().filter(|l| l.alive.load(Ordering::Acquire)).count();
+            let alive = links
+                .iter()
+                .filter(|l| l.alive.load(Ordering::Acquire))
+                .count();
             drop(links);
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
+            // Sweep orphaned virtual connections (handle_tcp_client exited but forgot cleanup)
+            hb_conns.retain(|_, vc| Arc::strong_count(vc) > 1);
             let uptime = start_time.elapsed().as_secs();
             info!(
                 uptime,
@@ -260,20 +274,25 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
 
     // 2. Accept SOCKS5 clients
     let listener = TcpListener::bind(cfg.listen_addr).await?;
-    let mut next_conn_id: u64 = 1;
+    let mut next_conn_id: u32 = 1;
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
-        let conn_id = next_conn_id as u32;
-        next_conn_id += 1;
+        let conn_id = next_conn_id;
+        next_conn_id = next_conn_id.wrapping_add(1);
+        if next_conn_id == 0 {
+            next_conn_id = 1;
+        } // skip UDP_CONN_ID
         let pool = pool.clone();
         let conns = conns.clone();
         let us = udp_sent.clone();
         let ur = udp_recv.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(conn_id, stream, peer, &pool, &conns, cfg.chunk_size, us, ur).await {
+            if let Err(e) =
+                handle_client(conn_id, stream, peer, &pool, &conns, cfg.chunk_size, us, ur).await
+            {
                 warn!(conn_id, peer = %peer, error = %e, "client handler failed");
             }
         });
@@ -338,6 +357,11 @@ fn handle_inbound_frame(frame: Frame, _tunnel_idx: usize, conns: &ConnMap, pool:
         return;
     }
 
+    // Ignore control frames (FIN/RST/SYN) for UDP relay; only DATA is valid.
+    if frame.conn_id == UDP_CONN_ID && frame.flags & FLAG_DATA == 0 {
+        return;
+    }
+
     if frame.flags & FLAG_DATA != 0 {
         if let Some(conn) = conns.get(&frame.conn_id) {
             conn.on_frame(frame.seq, frame.payload);
@@ -388,8 +412,19 @@ async fn handle_client(
         socks5::Socks5Result::Connect(accepted) => {
             handle_tcp_client(conn_id, accepted, peer, pool, conns, chunk_size).await
         }
-        socks5::Socks5Result::UdpAssociate { stream: keepalive, relay } => {
-            handle_udp_client(pool, conns, relay, keepalive, udp_sent.clone(), udp_recv.clone()).await
+        socks5::Socks5Result::UdpAssociate {
+            stream: keepalive,
+            relay,
+        } => {
+            handle_udp_client(
+                pool,
+                conns,
+                relay,
+                keepalive,
+                udp_sent.clone(),
+                udp_recv.clone(),
+            )
+            .await
         }
     }
 }
@@ -489,13 +524,15 @@ async fn handle_tcp_client(
     let fr = vconn.frames_recv.load(Ordering::Relaxed);
     drop(vconn);
     let _ = writer_task.await;
-    info!(conn_id,
+    info!(
+        conn_id,
         bytes_sent = bs,
         bytes_recv = br,
         frames_sent = fs,
         frames_recv = fr,
         duration_ms,
-        "closed");
+        "closed"
+    );
     Ok(())
 }
 
