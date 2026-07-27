@@ -6,6 +6,37 @@
 
 ---
 
+## Phase 8: 线上分析 Bug 修复 (2026-07-28)
+
+> **基线**: v1.10.0  
+> **参考**: `ONLINE_ANALYSIS_REPORT.md` (10h splitter 运行日志分析)
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/reorder.rs` | `push()` 返回值从 `Vec<Bytes>` 改为 `PushResult { ready, accepted }` | ISSUE-003: 满缓冲时静默丢弃帧，调用者无感知 |
+| `src/splitter.rs` | `VirtConn::on_frame()`: 检查 `accepted` 后更新统计，丢弃帧不计数 | ISSUE-003/005 |
+| `src/reassembler.rs` | DATA handler: 检查 `accepted` 后更新统计 | ISSUE-003/005 |
+| `src/reassembler.rs` | 待处理帧 drain: 适配新 API | ISSUE-003 |
+| `src/splitter.rs` | `FIN_GRACE_MS`: 500 → 3000 | ISSUE-004: 慢隧道下 FIN/DATA 乱序风险 |
+| `src/splitter.rs` | `handle_inbound_frame`: TIME_WAIT 中的 DATA 帧发出 WARN | ISSUE-004: 数据丢失可观测 |
+| `src/splitter.rs` | `handle_tcp_client`: 关闭日志新增 `reason` 字段 (eof/remote_fin/timeout/read_error/no_tunnel) | ISSUE-006: 连接关闭原因追踪 |
+
+### 行为变化
+- **修复**: `ReorderBuf` 满后返回 `accepted: false`，调用者不再错误更新统计
+- **修复**: 丢弃帧的 `bytes_recv`/`frames_recv`/`last_active` 不再被错误更新
+- **改进**: FIN_GRACE 从 500ms 增加到 3000ms，降低慢隧道数据丢失风险
+- **新增**: TIME_WAIT 内到达的 DATA 帧产生 WARN 日志（监控用）
+- **新增**: 关闭日志带 `reason` 字段，便于区分关闭路径
+
+### 测试结果
+- `cargo test`: 12/12 passed
+- `cargo clippy -- -D warnings`: 0 warnings
+- `cargo build --release`: 成功
+
+---
+
 ## Phase 1: 低风险清理
 
 ### 修改文件

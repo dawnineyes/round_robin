@@ -56,8 +56,12 @@ struct VirtConn {
 impl VirtConn {
     fn on_frame(&self, seq: u64, payload: Bytes) {
         let plen = payload.len() as u64;
-        let ready = self.reorder.lock().unwrap().push(seq, payload);
-        for chunk in ready {
+        let result = self.reorder.lock().unwrap().push(seq, payload);
+        if !result.accepted {
+            // Duplicate or buffer-full drop — don't update stats.
+            return;
+        }
+        for chunk in result.ready {
             let _ = self.to_client_tx.send(chunk);
         }
         self.bytes_recv.fetch_add(plen, Ordering::Relaxed);
@@ -351,6 +355,14 @@ fn handle_inbound_frame(
     if frame.flags & FLAG_DATA != 0 {
         if let Some(conn) = conns.get(&frame.conn_id) {
             conn.on_frame(frame.seq, frame.payload);
+        } else if time_wait.contains_key(&frame.conn_id) {
+            // Late DATA arrived after FIN but before TIME_WAIT expiry.
+            // This means the FIN_GRACE period was too short for this path.
+            warn!(
+                conn_id = frame.conn_id,
+                seq = frame.seq,
+                "late DATA frame on TIME_WAIT conn_id — possible data loss"
+            );
         } else {
             // Unknown conn_id: stale/dangling. Send RST so the
             // reassembler cleans up and stops flooding the tunnel.
@@ -485,6 +497,7 @@ async fn handle_tcp_client(
 
     let mut buf = vec![0u8; chunk_size];
     let mut seq: u64 = 1;
+    let close_reason: &str;
     loop {
         // Race client read against close notification.
         // Without this, a FIN from the reassembler would leave us
@@ -494,11 +507,15 @@ async fn handle_tcp_client(
         tokio::select! {
             result = client_reader.read(&mut buf) => {
                 match result {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        close_reason = "eof";
+                        break;
+                    }
                     Ok(n) => {
                         let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
                         if !pool.send(frame) {
                             warn!(conn_id, "no live tunnels, aborting");
+                            close_reason = "no_tunnel";
                             break;
                         }
                         vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
@@ -508,12 +525,18 @@ async fn handle_tcp_client(
                     }
                     Err(e) => {
                         warn!(conn_id, error = %e, "client read error");
+                        close_reason = "read_error";
                         break;
                     }
                 }
             }
             _ = vconn.notify.notified() => {
                 if vconn.closed.load(Ordering::Acquire) {
+                    close_reason = if vconn.fin_received.load(Ordering::Acquire) {
+                        "remote_fin"
+                    } else {
+                        "timeout"
+                    };
                     break;
                 }
                 // FIN/RST notification — loop back to check closed flag
@@ -526,7 +549,7 @@ async fn handle_tcp_client(
     // removing from conns.  Without this, a FIN arriving on tunnel A
     // would cause DATA frames still in-flight on tunnel B to trigger
     // an RST response (data loss).
-    const FIN_GRACE_MS: u64 = 500;
+    const FIN_GRACE_MS: u64 = 3000;
     tokio::time::sleep(Duration::from_millis(FIN_GRACE_MS)).await;
     // Move to TIME_WAIT before removing from conns so a new random
     // conn_id won't collide before the grace period expires.
@@ -547,6 +570,7 @@ async fn handle_tcp_client(
         frames_sent = fs,
         frames_recv = fr,
         duration_ms,
+        reason = close_reason,
         "closed"
     );
     Ok(())

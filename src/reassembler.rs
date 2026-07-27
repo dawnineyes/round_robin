@@ -402,8 +402,10 @@ async fn handle_frame(
         if let Some((_, entry)) = pending.remove(&cid) {
             for f in entry.frames {
                 if f.flags & FLAG_DATA != 0 {
-                    let ready = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
-                    for chunk in ready {
+                    let result = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
+                    // Pending frames are replayed — stats already counted when
+                    // originally queued, so don't double-count here.
+                    for chunk in result.ready {
                         if !vconn.egress.write(&chunk) {
                             warn!(conn_id = cid, "egress write failed (drain)");
                             break;
@@ -428,8 +430,11 @@ async fn handle_frame(
     if frame.flags & FLAG_DATA != 0 {
         if let Some(vconn) = conns.get(&cid) {
             let plen = frame.payload.len() as u64;
-            let ready = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
-            for chunk in ready {
+            let result = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
+            if !result.accepted {
+                return Ok(());
+            }
+            for chunk in result.ready {
                 if !vconn.egress.write(&chunk) {
                     warn!(conn_id = cid, "egress write failed");
                     break;

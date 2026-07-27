@@ -1,14 +1,14 @@
 # TEST_REPORT.md — Round Robin Refactoring
 
-> **日期**: 2026-07-27  
-> **基线**: v1.9.1  
-> **测试环境**: Windows 11, Rust edition 2024, tokio 1.x
+> **最新更新**: 2026-07-28 (Phase 8)  
+> **基线**: v1.9.1 → v1.10.0 → v1.10.1  
+> **测试环境**: Windows 11 Pro, Rust edition 2024, tokio 1.x
 
 ---
 
-## 单元测试结果
+## Phase 8: 线上分析 Bug 修复 (2026-07-28)
 
-### 最终状态 (Phase 5 完成后)
+### 单元测试结果
 
 ```
 running 12 tests
@@ -28,7 +28,29 @@ test frame::tests::decoder_multiple_frames ..... ok
 test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-### 测试覆盖
+### Quality Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo fmt` | ✅ Passed |
+| `cargo check` | ✅ 0 warnings |
+| `cargo test` | ✅ 12/12 passed |
+| `cargo clippy -- -D warnings` | ✅ 0 warnings |
+| `cargo build --release` | ✅ Passed |
+
+### Changed Files
+
+| File | Changes | Issue |
+|------|---------|-------|
+| `src/reorder.rs` | `push()` → `PushResult { ready, accepted }` | ISSUE-003 |
+| `src/splitter.rs` | `on_frame()` stats guard; FIN_GRACE 500→3000; TIME_WAIT DATA warn; close_reason | ISSUE-003/004/005/006 |
+| `src/reassembler.rs` | DATA handler accepted guard; pending drain API update | ISSUE-003/005 |
+
+---
+
+## 历史测试结果
+
+### 单元测试覆盖
 
 | 模块 | 测试数 | 覆盖内容 |
 |------|--------|----------|
@@ -37,15 +59,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 | `config` | 4 | `parse_ports` 范围/列表/单端口/非法范围 |
 | **合计** | **12** | |
 
-### 移除的测试
-
-| 测试 | 原因 |
-|------|------|
-| `frame::tests::ack_roundtrip` | `AckInfo` 和 `Frame::ack()` 已移除 (v1.8.1 废弃) |
-
----
-
-## 各 Phase 测试结果
+### 各 Phase 测试结果
 
 | Phase | 测试 | clippy | 备注 |
 |-------|------|--------|------|
@@ -55,11 +69,12 @@ test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 | 2 | 8/8 ✅ | 3 warnings | 提取 tunnel/reorder 模块 |
 | 3 | 12/12 ✅ | 3 warnings | 新增 4 个 config 测试 |
 | 4 | 12/12 ✅ | 3 warnings | idle timeout + concurrency limit |
-| 5 | 12/12 ✅ | **0** ✅ | conn_id TIME_WAIT + random ID + context structs |
+| 5 | 12/12 ✅ | 0 ✅ | conn_id TIME_WAIT + random ID + context structs |
+| 6 | 12/12 ✅ | 0 ✅ | FIN 竞态修复 |
+| 7 | 12/12 ✅ | 0 ✅ | 优雅关闭 |
+| **8** | **12/12** ✅ | **0** ✅ | **ReorderBuf accepted + FIN_GRACE + close_reason** |
 
----
-
-## 构建验证
+### 构建验证
 
 ```
 cargo check        — 每个 Phase 通过
@@ -68,19 +83,6 @@ cargo build        — 每个 Phase 通过
 cargo build --release — 最终验证通过
 cargo clippy       — 最终 0 warnings
 ```
-
----
-
-## 静态分析 (cargo clippy -- -W clippy::all)
-
-### 重构前 (7 warnings)
-- `dead_code` ×2: AckInfo, AckInfo::decode
-- `too_many_arguments` ×3: 3 functions with 8 args
-- `clone_on_copy` ×1: splitter.rs:591
-- `collapsible_if` ×1: splitter.rs:592
-
-### 重构后 (0 warnings)
-✅ 全部清理
 
 ---
 
@@ -99,6 +101,8 @@ cargo clippy       — 最终 0 warnings
 | 并发连接上限 | P2 | 超过 4096 连接 |
 | FIN 竞态 (多隧道) | P2 | FIN 先于 DATA 到达 |
 | 优雅关闭 | P2 | Ctrl+C 清理 |
+| **ReorderBuf 满后降级** | **P2** | **512 乱序帧后行为 (ISSUE-003)** |
+| **TIME_WAIT 延迟 DATA** | **P2** | **FIN_GRACE 3000ms 后的 DATA 帧 (ISSUE-004)** |
 
 ---
 
@@ -108,3 +112,4 @@ cargo clippy       — 最终 0 warnings
 2. **压测**: 用 `wrk` / `iperf3` 验证重构前后吞吐无退化
 3. **Fuzzing**: 对 `FrameDecoder` 和 `SynTarget::decode` 进行 fuzz 测试
 4. **CI**: 配置 GitHub Actions 自动运行 `cargo test` + `cargo clippy`
+5. **线上验证**: 部署新版本运行 24h+，监控 TIME_WAIT WARN 和 close_reason 分布
