@@ -277,13 +277,28 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
     let mut next_conn_id: u32 = 1;
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = loop {
+            match listener.accept().await {
+                Ok(v) => break v,
+                Err(e) => {
+                    warn!(error = %e, "accept failed, retrying in 100ms");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            }
+        };
         let _ = stream.set_nodelay(true);
-        let conn_id = next_conn_id;
-        next_conn_id = next_conn_id.wrapping_add(1);
-        if next_conn_id == 0 {
-            next_conn_id = 1;
-        } // skip UDP_CONN_ID
+        let conn_id = loop {
+            let id = next_conn_id;
+            next_conn_id = next_conn_id.wrapping_add(1);
+            if next_conn_id == 0 {
+                next_conn_id = 1;
+            }
+            if !conns.contains_key(&id) {
+                break id;
+            }
+            // ponytail: only matters at u32 wraparound (~4B connections)
+        };
         let pool = pool.clone();
         let conns = conns.clone();
         let us = udp_sent.clone();
@@ -497,7 +512,7 @@ async fn handle_tcp_client(
                         }
                         vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                         vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
-                        seq += 1;
+                        seq = seq.wrapping_add(1);
                     }
                     Err(e) => {
                         warn!(conn_id, error = %e, "client read error");
@@ -597,7 +612,13 @@ async fn handle_udp_client(
     loop {
         tokio::select! {
             result = relay.recv_from(&mut buf) => {
-                let (n, client) = result?;
+                let (n, client) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "UDP relay recv error");
+                        break;
+                    }
+                };
                 *client_addr.lock().unwrap() = Some(client);
                 udp_sent.fetch_add(1, Ordering::Relaxed);
                 let frame = Frame::data(UDP_CONN_ID, seq, Bytes::copy_from_slice(&buf[..n]));
@@ -605,7 +626,7 @@ async fn handle_udp_client(
                     warn!("UDP relay: no live tunnels");
                     break;
                 }
-                seq += 1;
+                seq = seq.wrapping_add(1);
             }
             _ = &mut ka_rx => {
                 info!("UDP keepalive closed, ending relay");

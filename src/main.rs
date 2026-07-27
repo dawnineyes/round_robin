@@ -76,15 +76,15 @@ fn default_chunk() -> usize {
 }
 
 fn default_splitter_listen() -> SocketAddr {
-    "127.0.0.1:52030".parse().unwrap()
+    "127.0.0.1:52310".parse().unwrap()
 }
 
 fn default_reassembler_ports() -> Ports {
-    Ports::Range("52031-52039".into())
+    Ports::Range("52311-52319".into())
 }
 
 fn default_local_target() -> SocketAddr {
-    "127.0.0.1:52030".parse().unwrap()
+    "127.0.0.1:52310".parse().unwrap()
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────

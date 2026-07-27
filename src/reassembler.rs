@@ -82,18 +82,6 @@ impl TunnelPool {
         }
         false
     }
-
-    fn send_via(&self, frame: Frame, src_link: usize) -> bool {
-        let links = self.links.lock().unwrap();
-        if src_link < links.len() {
-            let link = &links[src_link];
-            if link.alive.load(Ordering::Acquire) && link.tx.send(frame.clone()).is_ok() {
-                return true;
-            }
-        }
-        drop(links);
-        self.send(frame)
-    }
 }
 
 // ── Reorder buffer ────────────────────────────────────────────────────
@@ -347,7 +335,6 @@ async fn run_tunnel_listener(
                 pending,
                 pool,
                 local_target,
-                port as usize,
                 chunk_size,
                 udp,
                 &link2,
@@ -391,7 +378,6 @@ async fn tunnel_read_loop(
     pending: PendingMap,
     pool: Arc<TunnelPool>,
     local_target: SocketAddr,
-    src_port: usize,
     chunk_size: usize,
     udp_sock: Arc<UdpSocket>,
     link: &TunnelLink,
@@ -409,7 +395,6 @@ async fn tunnel_read_loop(
             &pending,
             &pool,
             local_target,
-            src_port,
             chunk_size,
             &udp_sock,
         )
@@ -427,7 +412,6 @@ async fn handle_frame(
     pending: &PendingMap,
     pool: &Arc<TunnelPool>,
     local_target: SocketAddr,
-    src_port: usize,
     chunk_size: usize,
     udp_sock: &Arc<UdpSocket>,
 ) -> Result<()> {
@@ -459,7 +443,7 @@ async fn handle_frame(
             Err(e) => {
                 warn!(conn_id = cid, error = %e, "SYN decode failed");
                 pending.remove(&cid);
-                pool.send_via(Frame::rst(cid), src_port);
+                pool.send(Frame::rst(cid));
                 return Ok(());
             }
         };
@@ -476,13 +460,13 @@ async fn handle_frame(
             Ok(Err(e)) => {
                 warn!(conn_id = cid, target = %syn_target.address, error = %e, "egress connect failed");
                 pending.remove(&cid);
-                pool.send_via(Frame::rst(cid), src_port);
+                pool.send(Frame::rst(cid));
                 return Ok(());
             }
             Err(_) => {
                 warn!(conn_id = cid, target = %syn_target.address, "egress connect timeout");
                 pending.remove(&cid);
-                pool.send_via(Frame::rst(cid), src_port);
+                pool.send(Frame::rst(cid));
                 return Ok(());
             }
         };
@@ -541,7 +525,7 @@ async fn handle_frame(
 
         // Reply SYN+ACK
         let syn_ack = Frame::syn_ack(cid);
-        pool.send_via(syn_ack, src_port);
+        pool.send(syn_ack);
 
         return Ok(());
     }
@@ -698,7 +682,7 @@ async fn read_from_egress(
                             vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                             vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
                         }
-                        seq += 1;
+                        seq = seq.wrapping_add(1);
                     }
                     Err(e) => {
                         warn!(conn_id, error = %e, "egress read error");
