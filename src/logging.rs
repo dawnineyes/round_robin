@@ -23,7 +23,12 @@ impl DailyLogWriter {
     pub fn new(dir: PathBuf, prefix: &str, keep_days: u64) -> io::Result<Self> {
         let date = today_utc();
         let file = open_log(&dir, prefix, &date)?;
-        Ok(Self { inner: Mutex::new(Inner { file, date }), dir, prefix: prefix.to_string(), keep_days })
+        Ok(Self {
+            inner: Mutex::new(Inner { file, date }),
+            dir,
+            prefix: prefix.to_string(),
+            keep_days,
+        })
     }
 }
 
@@ -102,8 +107,8 @@ fn open_log(dir: &Path, prefix: &str, date: &str) -> io::Result<File> {
 }
 
 pub fn purge_old_logs(dir: &Path, prefix: &str, keep_days: u64) {
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(keep_days * 86400));
+    let cutoff =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(keep_days * 86400));
     let Some(cutoff) = cutoff else { return };
     let cutoff_days = cutoff
         .duration_since(std::time::UNIX_EPOCH)
@@ -111,7 +116,9 @@ pub fn purge_old_logs(dir: &Path, prefix: &str, keep_days: u64) {
         .as_secs() as i64
         / 86400;
     let cutoff_date = days_to_civil(cutoff_days);
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");

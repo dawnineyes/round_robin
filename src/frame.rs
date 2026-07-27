@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 
 // ── Wire format (big-endian) ──────────────────────────────────────────
@@ -20,6 +20,13 @@ pub const MAX_PAYLOAD: usize = 65535;
 pub const MIN_CHUNK: usize = 512;
 pub const MAX_CHUNK: usize = 65535;
 
+/// Reserved conn_id for UDP relay traffic.
+pub const UDP_CONN_ID: u32 = 0;
+/// Max out-of-order entries before new arrivals are dropped.
+pub const MAX_REORDER_WINDOW: usize = 512;
+/// Max number of pending CIDs with DATA-before-SYN buffered (reassembler).
+pub const MAX_PENDING_CIDS: usize = 256;
+
 // ── Frame ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -32,31 +39,48 @@ pub struct Frame {
 
 impl Frame {
     pub fn data(conn_id: u32, seq: u64, payload: Bytes) -> Self {
-        Self { conn_id, seq, flags: FLAG_DATA, payload }
+        Self {
+            conn_id,
+            seq,
+            flags: FLAG_DATA,
+            payload,
+        }
     }
 
     pub fn syn(conn_id: u32, payload: Bytes) -> Self {
-        Self { conn_id, seq: 0, flags: FLAG_SYN, payload }
+        Self {
+            conn_id,
+            seq: 0,
+            flags: FLAG_SYN,
+            payload,
+        }
     }
 
     pub fn syn_ack(conn_id: u32) -> Self {
-        Self { conn_id, seq: 0, flags: FLAG_SYN | FLAG_ACK, payload: Bytes::new() }
+        Self {
+            conn_id,
+            seq: 0,
+            flags: FLAG_SYN | FLAG_ACK,
+            payload: Bytes::new(),
+        }
     }
 
     pub fn fin(conn_id: u32, seq: u64) -> Self {
-        Self { conn_id, seq, flags: FLAG_FIN, payload: Bytes::new() }
+        Self {
+            conn_id,
+            seq,
+            flags: FLAG_FIN,
+            payload: Bytes::new(),
+        }
     }
 
     pub fn rst(conn_id: u32) -> Self {
-        Self { conn_id, seq: 0, flags: FLAG_RST, payload: Bytes::new() }
-    }
-
-    #[allow(dead_code)]
-    pub fn ack(conn_id: u32, ack_seq: u64, window: u32) -> Self {
-        let mut payload = BytesMut::with_capacity(12);
-        payload.put_u64(ack_seq);
-        payload.put_u32(window);
-        Self { conn_id, seq: 0, flags: FLAG_ACK, payload: payload.freeze() }
+        Self {
+            conn_id,
+            seq: 0,
+            flags: FLAG_RST,
+            payload: Bytes::new(),
+        }
     }
 
     pub fn encode(&self) -> Bytes {
@@ -73,8 +97,6 @@ impl Frame {
 // ── SYN payload helpers ───────────────────────────────────────────────
 
 pub const PROTO_TCP: u8 = 0x06;
-#[allow(dead_code)]
-pub const PROTO_UDP: u8 = 0x11;
 
 #[derive(Debug, Clone)]
 pub struct SynTarget {
@@ -105,28 +127,11 @@ impl SynTarget {
         }
         let address = String::from_utf8(payload[3..3 + addr_len].to_vec())?;
         let port = u16::from_be_bytes([payload[3 + addr_len], payload[4 + addr_len]]);
-        Ok(SynTarget { proto, address, port })
-    }
-}
-
-// ── ACK payload helpers ───────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct AckInfo {
-    #[allow(dead_code)]
-    pub ack_seq: u64,
-    #[allow(dead_code)]
-    pub window: u32,
-}
-
-impl AckInfo {
-    pub fn decode(payload: &[u8]) -> Result<Self> {
-        if payload.len() < 12 {
-            bail!("ACK payload too short");
-        }
-        let ack_seq = u64::from_be_bytes(payload[0..8].try_into().unwrap());
-        let window = u32::from_be_bytes(payload[8..12].try_into().unwrap());
-        Ok(AckInfo { ack_seq, window })
+        Ok(SynTarget {
+            proto,
+            address,
+            port,
+        })
     }
 }
 
@@ -140,7 +145,9 @@ pub struct FrameDecoder {
 
 impl FrameDecoder {
     pub fn new() -> Self {
-        Self { buf: BytesMut::with_capacity(16384) }
+        Self {
+            buf: BytesMut::with_capacity(16384),
+        }
     }
 
     /// Read from `rd` until a complete frame is available. Returns `None`
@@ -152,22 +159,23 @@ impl FrameDecoder {
         loop {
             // Try to parse a complete frame from the buffer
             if self.buf.len() >= HEADER_LEN {
-                let payload_len =
-                    u16::from_be_bytes([self.buf[13], self.buf[14]]) as usize;
+                let payload_len = u16::from_be_bytes([self.buf[13], self.buf[14]]) as usize;
                 if payload_len > MAX_PAYLOAD {
                     bail!("frame payload too large: {payload_len}");
                 }
                 if self.buf.len() >= HEADER_LEN + payload_len {
-                    let conn_id = u32::from_be_bytes(
-                        [self.buf[0], self.buf[1], self.buf[2], self.buf[3]],
-                    );
-                    let seq = u64::from_be_bytes(
-                        self.buf[4..12].try_into().unwrap(),
-                    );
+                    let conn_id =
+                        u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+                    let seq = u64::from_be_bytes(self.buf[4..12].try_into().unwrap());
                     let flags = self.buf[12];
                     let _ = self.buf.split_to(HEADER_LEN);
                     let payload = self.buf.split_to(payload_len).freeze();
-                    return Ok(Some(Frame { conn_id, seq, flags, payload }));
+                    return Ok(Some(Frame {
+                        conn_id,
+                        seq,
+                        flags,
+                        payload,
+                    }));
                 }
             }
 
@@ -242,7 +250,15 @@ mod tests {
     #[tokio::test]
     async fn decoder_tiny_reads() {
         // Simulate byte-by-byte reads to stress the buffer logic
-        let f = Frame::syn(7, SynTarget { proto: PROTO_TCP, address: "example.com".into(), port: 443 }.encode());
+        let f = Frame::syn(
+            7,
+            SynTarget {
+                proto: PROTO_TCP,
+                address: "example.com".into(),
+                port: 443,
+            }
+            .encode(),
+        );
         let encoded = f.encode();
         let mut decoder = FrameDecoder::new();
 
@@ -287,20 +303,16 @@ mod tests {
 
     #[test]
     fn syn_target_roundtrip() {
-        let t = SynTarget { proto: PROTO_TCP, address: "example.com".into(), port: 443 };
+        let t = SynTarget {
+            proto: PROTO_TCP,
+            address: "example.com".into(),
+            port: 443,
+        };
         let encoded = t.encode();
         let decoded = SynTarget::decode(&encoded).unwrap();
         assert_eq!(decoded.proto, PROTO_TCP);
         assert_eq!(decoded.address, "example.com");
         assert_eq!(decoded.port, 443);
-    }
-
-    #[test]
-    fn ack_roundtrip() {
-        let f = Frame::ack(1, 100, 64);
-        let info = AckInfo::decode(&f.payload).unwrap();
-        assert_eq!(info.ack_seq, 100);
-        assert_eq!(info.window, 64);
     }
 
     #[test]

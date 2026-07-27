@@ -1,21 +1,21 @@
 use crate::frame::{
-    FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, SynTarget,
+    FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, MAX_PENDING_CIDS,
+    SynTarget, UDP_CONN_ID,
 };
+use crate::reorder::ReorderBuf;
 use crate::socks5;
+use crate::tunnel::{TunnelLink, TunnelPool, drain_frames};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
-
-const UDP_CONN_ID: u32 = 0;
 
 // ── Config ────────────────────────────────────────────────────────────
 
@@ -24,107 +24,6 @@ pub struct ReassemblerConfig {
     pub listen_ports: Vec<u16>,
     pub local_target: SocketAddr,
     pub chunk_size: usize,
-}
-
-// ── Tunnel pool (same pattern as splitter) ────────────────────────────
-
-struct TunnelLink {
-    tx: mpsc::UnboundedSender<Frame>,
-    alive: AtomicBool,
-    bytes_sent: AtomicU64,
-    bytes_recv: AtomicU64,
-    frames_sent: AtomicU64,
-    frames_recv: AtomicU64,
-}
-
-struct TunnelPool {
-    links: Mutex<Vec<Arc<TunnelLink>>>,
-    rr: AtomicUsize,
-}
-
-impl TunnelPool {
-    fn new() -> Self {
-        Self {
-            links: Mutex::new(Vec::new()),
-            rr: AtomicUsize::new(0),
-        }
-    }
-
-    fn add(&self, link: Arc<TunnelLink>) {
-        self.links.lock().unwrap().push(link);
-    }
-
-    /// Remove dead links from the pool. Called periodically from heartbeat.
-    fn compact(&self) {
-        let mut links = self.links.lock().unwrap();
-        let before = links.len();
-        links.retain(|l| l.alive.load(Ordering::Acquire));
-        if links.len() != before {
-            self.rr.store(0, Ordering::Release);
-        }
-    }
-
-    fn send(&self, frame: Frame) -> bool {
-        let links = self.links.lock().unwrap();
-        if links.is_empty() {
-            return false;
-        }
-        let start = self.rr.fetch_add(1, Ordering::Relaxed) % links.len();
-        for i in 0..links.len() {
-            let link = &links[(start + i) % links.len()];
-            if !link.alive.load(Ordering::Acquire) {
-                continue;
-            }
-            if link.tx.send(frame.clone()).is_ok() {
-                return true;
-            }
-            link.alive.store(false, Ordering::Release);
-        }
-        false
-    }
-}
-
-// ── Reorder buffer ────────────────────────────────────────────────────
-
-/// Max out-of-order entries before we drop new arrivals.
-const MAX_PENDING_ENTRIES: usize = 512;
-/// Max number of pending cids with DATA-before-SYN buffered.
-const MAX_PENDING_CIDS: usize = 256;
-
-struct ReorderBuf {
-    expected: u64,
-    pending: BTreeMap<u64, Bytes>,
-}
-
-impl ReorderBuf {
-    fn new() -> Self {
-        Self {
-            expected: 1,
-            pending: BTreeMap::new(),
-        }
-    }
-
-    /// Returns in-order chunks. Out-of-order frames are buffered until the gap fills.
-    /// TUIC TCP guarantees delivery — we just wait.
-    fn push(&mut self, seq: u64, payload: Bytes) -> Vec<Bytes> {
-        let mut out = Vec::new();
-
-        if seq < self.expected {
-            return out;
-        }
-        if seq == self.expected {
-            out.push(payload);
-            self.expected = self.expected.wrapping_add(1);
-            while let Some(chunk) = self.pending.remove(&self.expected) {
-                out.push(chunk);
-                self.expected = self.expected.wrapping_add(1);
-            }
-        } else if self.pending.len() < MAX_PENDING_ENTRIES {
-            self.pending.insert(seq, payload);
-        }
-
-        out
-    }
 }
 
 // ── Egress connection ─────────────────────────────────────────────────
@@ -146,11 +45,16 @@ struct VirtConnDe {
     reorder: Mutex<ReorderBuf>,
     cancel: Arc<Notify>,
     created_at: Instant,
+    last_active: Mutex<Instant>,
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
     frames_sent: AtomicU64,
     frames_recv: AtomicU64,
 }
+
+/// Idle timeout constants for automatic connection cleanup.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ConnMap = Arc<DashMap<u32, Arc<VirtConnDe>>>;
 
@@ -222,19 +126,17 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let local_target = cfg.local_target;
         let listen_ip = cfg.listen_ip;
         let udp = udp_sock.clone();
+        let lctx = ListenerCtx {
+            listen_ip,
+            local_target,
+            conns,
+            pending,
+            pool,
+            chunk_size: cfg.chunk_size,
+            udp_sock: udp,
+        };
         tokio::spawn(async move {
-            if let Err(e) = run_tunnel_listener(
-                listen_ip,
-                port,
-                local_target,
-                conns,
-                pending,
-                pool,
-                cfg.chunk_size,
-                udp,
-            )
-            .await
-            {
+            if let Err(e) = run_tunnel_listener(port, lctx).await {
                 error!(port, error = %e, "listener died");
             }
         });
@@ -250,15 +152,27 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let links = hb_pool.links.lock().unwrap();
-            let total = links.len();
-            let alive = links
-                .iter()
-                .filter(|l| l.alive.load(Ordering::Acquire))
-                .count();
-            drop(links);
+            let (alive, total) = hb_pool.stats();
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
+            // Sweep idle connections
+            let now = Instant::now();
+            hb_conns.retain(|&cid, vc| {
+                let idle = now
+                    .duration_since(*vc.last_active.lock().unwrap())
+                    .as_secs();
+                let timeout = if cid == UDP_CONN_ID {
+                    UDP_IDLE_TIMEOUT.as_secs()
+                } else {
+                    TCP_IDLE_TIMEOUT.as_secs()
+                };
+                if idle > timeout {
+                    warn!(conn_id = cid, idle_secs = idle, "connection idle timeout");
+                    vc.cancel.notify_one();
+                    return false;
+                }
+                true
+            });
             // Sweep stale pending entries that never got a SYN
             hb_pending.retain(|_, entry| entry.since.elapsed().as_secs() < PENDING_TTL_SECS);
             let uptime = start_time.elapsed().as_secs();
@@ -278,18 +192,19 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     Ok(())
 }
 
-async fn run_tunnel_listener(
+struct ListenerCtx {
     listen_ip: IpAddr,
-    port: u16,
     local_target: SocketAddr,
     conns: ConnMap,
     pending: PendingMap,
     pool: Arc<TunnelPool>,
     chunk_size: usize,
     udp_sock: Arc<UdpSocket>,
-) -> Result<()> {
-    let listener = TcpListener::bind((listen_ip, port)).await?;
-    info!(listen = %listen_ip, port, "tunnel listener ready");
+}
+
+async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
+    let listener = TcpListener::bind((ctx.listen_ip, port)).await?;
+    info!(listen = %ctx.listen_ip, port, "tunnel listener ready");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -305,7 +220,7 @@ async fn run_tunnel_listener(
             }
         };
 
-        info!(peer = %peer, port, pool_size = pool.links.lock().unwrap().len() + 1, "tunnel link accepted");
+        info!(peer = %peer, port, pool_size = ctx.pool.link_count() + 1, "tunnel link accepted");
 
         let (rd, wr) = stream.into_split();
         let (tx, rx) = mpsc::unbounded_channel::<Frame>();
@@ -317,71 +232,49 @@ async fn run_tunnel_listener(
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
         });
-        pool.add(link.clone());
+        ctx.pool.add(link.clone());
 
         // Writer task
         tokio::spawn(drain_frames(rx, wr, link.clone()));
 
         // Reader task (one per link)
-        let conns = conns.clone();
-        let pending = pending.clone();
-        let pool = pool.clone();
-        let udp = udp_sock.clone();
-        let link2 = link.clone();
+        let reader_ctx = ReadLoopCtx {
+            conns: ctx.conns.clone(),
+            pending: ctx.pending.clone(),
+            pool: ctx.pool.clone(),
+            local_target: ctx.local_target,
+            chunk_size: ctx.chunk_size,
+            udp_sock: ctx.udp_sock.clone(),
+            link: link.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = tunnel_read_loop(
-                rd,
-                conns,
-                pending,
-                pool,
-                local_target,
-                chunk_size,
-                udp,
-                &link2,
-            )
-            .await
-            {
+            if let Err(e) = tunnel_read_loop(rd, reader_ctx).await {
                 warn!(tunnel = port, error = %e, "read loop ended");
             }
-            link2.alive.store(false, Ordering::Release);
+            link.alive.store(false, Ordering::Release);
             info!(
                 tunnel = port,
-                bytes_sent = link2.bytes_sent.load(Ordering::Relaxed),
-                bytes_recv = link2.bytes_recv.load(Ordering::Relaxed),
-                frames_sent = link2.frames_sent.load(Ordering::Relaxed),
-                frames_recv = link2.frames_recv.load(Ordering::Relaxed),
+                bytes_sent = link.bytes_sent.load(Ordering::Relaxed),
+                bytes_recv = link.bytes_recv.load(Ordering::Relaxed),
+                frames_sent = link.frames_sent.load(Ordering::Relaxed),
+                frames_recv = link.frames_recv.load(Ordering::Relaxed),
                 "disconnected"
             );
         });
     }
 }
 
-async fn drain_frames(
-    mut rx: mpsc::UnboundedReceiver<Frame>,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
-    link: Arc<TunnelLink>,
-) {
-    while let Some(frame) = rx.recv().await {
-        let n = frame.payload.len() as u64;
-        if wr.write_all(&frame.encode()).await.is_err() {
-            break;
-        }
-        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
-        link.frames_sent.fetch_add(1, Ordering::Relaxed);
-    }
-    let _ = wr.shutdown().await;
-}
-
-async fn tunnel_read_loop(
-    mut rd: tokio::net::tcp::OwnedReadHalf,
+struct ReadLoopCtx {
     conns: ConnMap,
     pending: PendingMap,
     pool: Arc<TunnelPool>,
     local_target: SocketAddr,
     chunk_size: usize,
     udp_sock: Arc<UdpSocket>,
-    link: &TunnelLink,
-) -> Result<()> {
+    link: Arc<TunnelLink>,
+}
+
+async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopCtx) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
         let frame = match decoder.try_next(&mut rd).await? {
@@ -391,16 +284,16 @@ async fn tunnel_read_loop(
         let plen = frame.payload.len() as u64;
         handle_frame(
             frame,
-            &conns,
-            &pending,
-            &pool,
-            local_target,
-            chunk_size,
-            &udp_sock,
+            &ctx.conns,
+            &ctx.pending,
+            &ctx.pool,
+            ctx.local_target,
+            ctx.chunk_size,
+            &ctx.udp_sock,
         )
         .await?;
-        link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
-        link.frames_recv.fetch_add(1, Ordering::Relaxed);
+        ctx.link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
+        ctx.link.frames_recv.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -481,6 +374,7 @@ async fn handle_frame(
             reorder: Mutex::new(ReorderBuf::new()),
             cancel: cancel.clone(),
             created_at: Instant::now(),
+            last_active: Mutex::new(Instant::now()),
             bytes_sent: AtomicU64::new(0),
             bytes_recv: AtomicU64::new(0),
             frames_sent: AtomicU64::new(0),
@@ -543,6 +437,7 @@ async fn handle_frame(
             }
             vconn.bytes_recv.fetch_add(plen, Ordering::Relaxed);
             vconn.frames_recv.fetch_add(1, Ordering::Relaxed);
+            *vconn.last_active.lock().unwrap() = Instant::now();
             return Ok(());
         }
         // Not in conns — could be pending (SYN still in flight) or
@@ -681,6 +576,7 @@ async fn read_from_egress(
                         if let Some(vconn) = conns.get(&conn_id) {
                             vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                             vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
+                            *vconn.last_active.lock().unwrap() = Instant::now();
                         }
                         seq = seq.wrapping_add(1);
                     }
