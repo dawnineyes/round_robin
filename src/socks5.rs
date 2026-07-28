@@ -131,53 +131,6 @@ fn encode_reply(rep: u8, addr: SocketAddr) -> Vec<u8> {
     v
 }
 
-/// SOCKS5 server handshake for tunnel links: accept no-auth, accept any
-/// CONNECT target, reply success. Returns the stream for frame I/O.
-pub async fn socks5_accept_tunnel(mut stream: TcpStream) -> Result<TcpStream> {
-    // Greeting
-    let mut hdr = [0u8; 2];
-    stream.read_exact(&mut hdr).await?;
-    if hdr[0] != SOCKS_VERSION {
-        bail!("not SOCKS5 (version {})", hdr[0]);
-    }
-    let nmethods = hdr[1] as usize;
-    if nmethods == 0 || nmethods > 16 {
-        bail!("invalid nmethods: {nmethods}");
-    }
-    let mut methods = vec![0u8; nmethods];
-    stream.read_exact(&mut methods).await?;
-    if !methods.contains(&AUTH_NONE) {
-        stream.write_all(&[SOCKS_VERSION, 0xFF]).await?;
-        bail!("tunnel requires auth, only no-auth supported");
-    }
-    stream.write_all(&[SOCKS_VERSION, AUTH_NONE]).await?;
-
-    // Request — read it but ignore the target
-    let mut req = [0u8; 4];
-    stream.read_exact(&mut req).await?;
-    if req[0] != SOCKS_VERSION {
-        bail!("bad SOCKS5 request version");
-    }
-    drain_address(&mut stream, req[3]).await?;
-
-    // Reply success
-    let rep = [
-        SOCKS_VERSION,
-        REP_SUCCESS,
-        0x00,
-        ATYP_IPV4,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
-    stream.write_all(&rep).await?;
-
-    Ok(stream)
-}
-
 // ── Client-side: connect through a SOCKS5 proxy ───────────────────────
 
 /// SOCKS5 CONNECT through `proxy` to `target`. Returns the stream ready

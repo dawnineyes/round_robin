@@ -210,15 +210,8 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
 
-        // SOCKS5 handshake: sing-box SOCKS5 outbound CONNECTs here.
-        // Accept any no-auth client, ignore the CONNECT target.
-        let stream = match socks5::socks5_accept_tunnel(stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(peer = %peer, error = %e, "SOCKS5 handshake failed");
-                continue;
-            }
-        };
+        // Raw TCP — sing-box direct outbound connects here.
+        // No SOCKS5 handshake needed; TUIC streams carry their own target.
 
         info!(peer = %peer, port, pool_size = ctx.pool.link_count() + 1, "tunnel link accepted");
 
