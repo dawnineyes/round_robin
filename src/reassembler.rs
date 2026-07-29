@@ -4,9 +4,9 @@ use crate::frame::{
 };
 use crate::reorder::ReorderBuf;
 use crate::socks5;
-use crate::tunnel::{TunnelLink, TunnelPool, drain_frames};
+use crate::tunnel::{TUNNEL_CHANNEL_CAP, TunnelLink, TunnelPool, drain_frames};
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,8 +33,8 @@ struct EgressConn {
 }
 
 impl EgressConn {
-    fn write(&self, data: &[u8]) -> bool {
-        self.write_tx.send(Bytes::copy_from_slice(data)).is_ok()
+    fn write(&self, data: Bytes) -> bool {
+        self.write_tx.send(data).is_ok()
     }
 }
 
@@ -216,7 +216,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
         info!(peer = %peer, port, pool_size = ctx.pool.link_count() + 1, "tunnel link accepted");
 
         let (rd, wr) = stream.into_split();
-        let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
         let link = Arc::new(TunnelLink {
             tx,
             alive: AtomicBool::new(true),
@@ -399,7 +399,7 @@ async fn handle_frame(
                     // Pending frames are replayed — stats already counted when
                     // originally queued, so don't double-count here.
                     for chunk in result.ready {
-                        if !vconn.egress.write(&chunk) {
+                        if !vconn.egress.write(chunk) {
                             warn!(conn_id = cid, "egress write failed (drain)");
                             break;
                         }
@@ -428,7 +428,7 @@ async fn handle_frame(
                 return Ok(());
             }
             for chunk in result.ready {
-                if !vconn.egress.write(&chunk) {
+                if !vconn.egress.write(chunk) {
                     warn!(conn_id = cid, "egress write failed");
                     break;
                 }
@@ -539,20 +539,23 @@ async fn read_from_egress(
     chunk_size: usize,
     cancel: Arc<Notify>,
 ) {
-    let mut buf = vec![0u8; chunk_size];
     let mut seq: u64 = 1;
     let mut cancelled = false;
     loop {
+        // read_buf reads directly into BytesMut — freeze() yields the
+        // payload with zero copy and only the bytes actually read are
+        // allocated (no 65KB zero-fill).
+        let mut buf = BytesMut::with_capacity(chunk_size);
         tokio::select! {
             _ = cancel.notified() => {
                 cancelled = true;
                 break;
             }
-            result = rd.read(&mut buf) => {
+            result = rd.read_buf(&mut buf) => {
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
-                        let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
+                        let frame = Frame::data(conn_id, seq, buf.freeze());
                         // Backpressure: if all tunnel channels are momentarily full,
                         // yield and retry instead of killing the connection.
                         let mut sent = false;

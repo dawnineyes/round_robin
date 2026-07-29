@@ -4,9 +4,9 @@ use crate::frame::{
 };
 use crate::reorder::ReorderBuf;
 use crate::socks5;
-use crate::tunnel::{TunnelLink, TunnelPool, drain_frames};
+use crate::tunnel::{TUNNEL_CHANNEL_CAP, TunnelLink, TunnelPool, drain_frames};
 use anyhow::{Result, bail};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -109,7 +109,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                         retry_count = 0;
                         info!(tunnel = i, proxy = %ep.proxy, target = %ep.target, port = ep.port, "connected");
                         let (rd, wr) = stream.into_split();
-                        let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+                        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
                         let link = Arc::new(TunnelLink {
                             tx,
                             alive: AtomicBool::new(true),
@@ -495,26 +495,36 @@ async fn handle_tcp_client(
         let _ = client_writer.shutdown().await;
     });
 
-    let mut buf = vec![0u8; chunk_size];
     let mut seq: u64 = 1;
     let close_reason: &str;
     loop {
+        // read_buf reads directly into BytesMut, allocating only what
+        // the TCP stream delivers.  freeze() converts to Bytes with zero
+        // copy — no separate allocation and no copy_from_slice.
+        let mut buf = BytesMut::with_capacity(chunk_size);
         // Race client read against close notification.
-        // Without this, a FIN from the reassembler would leave us
-        // stuck in read() while the browser holds the connection open
-        // (HTTP keep-alive), and the hung connection keeps tunnels in
-        // short-timeout mode, causing tunnel cycling.
         tokio::select! {
-            result = client_reader.read(&mut buf) => {
+            result = client_reader.read_buf(&mut buf) => {
                 match result {
                     Ok(0) => {
                         close_reason = "eof";
                         break;
                     }
                     Ok(n) => {
-                        let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
-                        if !pool.send(frame) {
-                            warn!(conn_id, "no live tunnels, aborting");
+                        let frame = Frame::data(conn_id, seq, buf.freeze());
+                        // Backpressure: if all tunnel channels are full, yield
+                        // briefly to let drain_frames catch up instead of
+                        // immediately killing the connection.
+                        let mut sent = false;
+                        for _ in 0..10 {
+                            if pool.send(frame.clone()) {
+                                sent = true;
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        if !sent {
+                            warn!(conn_id, "no live tunnels after retries, aborting");
                             close_reason = "no_tunnel";
                             break;
                         }
@@ -649,9 +659,17 @@ async fn handle_udp_client(
                 *client_addr.lock().unwrap() = Some(client);
                 udp_sent.fetch_add(1, Ordering::Relaxed);
                 let frame = Frame::data(UDP_CONN_ID, seq, Bytes::copy_from_slice(&buf[..n]));
-                if !pool.send(frame) {
-                    warn!("UDP relay: no live tunnels");
-                    break;
+                let mut sent = false;
+                for _ in 0..3 {
+                    if pool.send(frame.clone()) {
+                        sent = true;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                if !sent {
+                    warn!("UDP relay: no live tunnels, dropping datagram");
+                    continue;
                 }
                 seq = seq.wrapping_add(1);
             }

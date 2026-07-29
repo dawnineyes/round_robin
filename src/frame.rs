@@ -137,6 +137,11 @@ impl SynTarget {
 
 // ── Streaming frame decoder ───────────────────────────────────────────
 
+/// Max decoder buffer before we bail out.  One full max frame plus two
+/// read blocks of headroom — anything larger indicates a malformed or
+/// malicious peer that never completes a frame.
+const MAX_DECODER_BUF: usize = HEADER_LEN + MAX_PAYLOAD + 16384; // ~81 KB
+
 /// Stateful decoder that reads from a TCP byte stream and yields complete
 /// frames one at a time. Handles frames up to 64 KiB payload.
 pub struct FrameDecoder {
@@ -188,6 +193,16 @@ impl FrameDecoder {
                 } else {
                     bail!("EOF mid-frame ({} buffered bytes)", self.buf.len())
                 };
+            }
+            // Guard against unbounded growth from malformed / malicious peers
+            // that never send a complete frame.
+            if self.buf.len() + n > MAX_DECODER_BUF {
+                bail!(
+                    "frame decoder buffer overflow ({} + {} > {})",
+                    self.buf.len(),
+                    n,
+                    MAX_DECODER_BUF
+                );
             }
             self.buf.extend_from_slice(&tmp[..n]);
         }

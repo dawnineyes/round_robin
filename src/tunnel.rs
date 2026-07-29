@@ -4,10 +4,14 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+/// Per-tunnel send queue capacity. At 65535 bytes max frame, 128
+/// entries = ~8 MB max backlog per tunnel before backpressure kicks in.
+pub const TUNNEL_CHANNEL_CAP: usize = 128;
+
 // ── Tunnel link ────────────────────────────────────────────────────────
 
 pub struct TunnelLink {
-    pub tx: mpsc::UnboundedSender<Frame>,
+    pub tx: mpsc::Sender<Frame>,
     pub alive: AtomicBool,
     pub bytes_sent: AtomicU64,
     pub bytes_recv: AtomicU64,
@@ -59,7 +63,9 @@ impl TunnelPool {
         (alive, total)
     }
 
-    /// Round-robin send. Unbounded sender — only fails if link is dead.
+    /// Round-robin send with backpressure.  Uses `try_send` so that a
+    /// full channel skips to the next link instead of blocking.
+    /// Returns false only when no link can accept the frame.
     pub fn send(&self, frame: Frame) -> bool {
         let links = self.links.lock().unwrap();
         if links.is_empty() {
@@ -71,10 +77,16 @@ impl TunnelPool {
             if !link.alive.load(Ordering::Acquire) {
                 continue;
             }
-            if link.tx.send(frame.clone()).is_ok() {
-                return true;
+            match link.tx.try_send(frame.clone()) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    link.alive.store(false, Ordering::Release);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Link is alive but its queue is full — try next link.
+                    continue;
+                }
             }
-            link.alive.store(false, Ordering::Release);
         }
         false
     }
@@ -83,7 +95,7 @@ impl TunnelPool {
 // ── Drain frames ───────────────────────────────────────────────────────
 
 pub async fn drain_frames(
-    mut rx: mpsc::UnboundedReceiver<Frame>,
+    mut rx: mpsc::Receiver<Frame>,
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     link: Arc<TunnelLink>,
 ) {
