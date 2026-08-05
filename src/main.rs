@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
             .with_writer(writer)
             .init();
     }
-    // Stale-log purge happens on daily rotation inside DailyLogWriter.
+    // Stale-log purge happens at startup and on daily rotation inside DailyLogWriter.
 
     // Startup banner (goes to log file if logging enabled, otherwise discarded)
     let (listen, tunnels) = match cfg.mode.as_str() {

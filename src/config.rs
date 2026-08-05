@@ -104,7 +104,7 @@ pub fn find_config() -> Result<String> {
     bail!("no config file found: tried config.toml, round_robin.toml")
 }
 
-// Log cleanup handled by logging::DailyLogWriter on daily rotation.
+// Log cleanup handled by logging::DailyLogWriter at startup and on daily rotation.
 
 // ── Port parsing ──────────────────────────────────────────────────────
 

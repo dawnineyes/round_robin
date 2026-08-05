@@ -6,7 +6,9 @@ use std::sync::Mutex;
 /// Custom daily-rolling log writer.
 ///
 /// Creates files named `prefix.YYYY-MM-DD.log` in `dir`, rotates at
-/// midnight UTC, and purges files older than `keep_days`.
+/// midnight UTC, and purges files older than `keep_days`. Purge runs at
+/// startup and on each rotation — rotation alone is unreliable because
+/// it only fires if a process happens to survive across midnight.
 pub struct DailyLogWriter {
     inner: Mutex<Inner>,
     dir: PathBuf,
@@ -23,6 +25,10 @@ impl DailyLogWriter {
     pub fn new(dir: PathBuf, prefix: &str, keep_days: u64) -> io::Result<Self> {
         let date = today_utc();
         let file = open_log(&dir, prefix, &date)?;
+        // Purge stale logs at startup. Rotation-based purge alone never
+        // runs if the process is restarted around midnight (state.date is
+        // set to today on open, so no rotation fires until tomorrow).
+        purge_old_logs(&dir, prefix, keep_days);
         Ok(Self {
             inner: Mutex::new(Inner { file, date }),
             dir,
