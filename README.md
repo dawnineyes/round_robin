@@ -70,7 +70,7 @@ local_target = "127.0.0.1:52035"
 | `listen` | IpAddr | 隧道监听 IP |
 | `ports` | range/list | 监听端口 |
 | `local_target` | SocketAddr | 出站 SOCKS5 目标 |
-| `chunk_size` | usize | 分片大小，默认 16384 |
+| `chunk_size` | usize | 分片大小，默认 65535 |
 
 ## 协议
 
@@ -86,13 +86,13 @@ Payload   [u8]  Length bytes
 
 SYN payload: `Proto(u8) + AddrLen(u16) + Address(variable) + Port(u16)`
 
-ACK 帧保留在协议中但当前版本不使用——TUIC TCP 保证送达，无需应用层流量控制。
+SYN+ACK 与 ACK 帧保留在协议定义中但当前版本不使用（v1.10.4 起不再发送 SYN+ACK）——TUIC TCP 保证送达，无需应用层握手确认或流量控制。FIN 帧携带 next_seq，reassembler 据此在所有在途 DATA 送达后精确半关闭 egress 写端。
 
 ## 发布
 
 ```bash
-git tag v1.9.1
-git push origin v1.9.1
+git tag v1.10.4
+git push origin v1.10.4
 ```
 
 GitHub Actions 自动编译 Linux x86_64 并发布 Release。

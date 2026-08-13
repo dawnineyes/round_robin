@@ -13,7 +13,8 @@ pub const FLAG_SYN: u8 = 0x01;
 pub const FLAG_DATA: u8 = 0x02;
 pub const FLAG_FIN: u8 = 0x04;
 pub const FLAG_RST: u8 = 0x08;
-pub const FLAG_ACK: u8 = 0x10;
+// ACK (0x10) is reserved in the wire format but unused — TUIC TCP
+// guarantees delivery, so no application-level flow control is needed.
 
 pub const HEADER_LEN: usize = 4 + 8 + 1 + 2; // 15
 pub const MAX_PAYLOAD: usize = 65535;
@@ -56,15 +57,6 @@ impl Frame {
         }
     }
 
-    pub fn syn_ack(conn_id: u32) -> Self {
-        Self {
-            conn_id,
-            seq: 0,
-            flags: FLAG_SYN | FLAG_ACK,
-            payload: Bytes::new(),
-        }
-    }
-
     pub fn fin(conn_id: u32, seq: u64) -> Self {
         Self {
             conn_id,
@@ -84,6 +76,14 @@ impl Frame {
     }
 
     pub fn encode(&self) -> Bytes {
+        // Callers must never build a frame larger than the u16 length
+        // field can express — truncating here would corrupt the stream
+        // (the tail would be parsed as the next frame header).
+        debug_assert!(
+            self.payload.len() <= MAX_PAYLOAD,
+            "frame payload too large: {} > {MAX_PAYLOAD}",
+            self.payload.len()
+        );
         let mut buf = BytesMut::with_capacity(HEADER_LEN + self.payload.len());
         buf.put_u32(self.conn_id);
         buf.put_u64(self.seq);
@@ -328,14 +328,5 @@ mod tests {
         assert_eq!(decoded.proto, PROTO_TCP);
         assert_eq!(decoded.address, "example.com");
         assert_eq!(decoded.port, 443);
-    }
-
-    #[test]
-    fn flags_composition() {
-        let syn_ack = FLAG_SYN | FLAG_ACK;
-        assert_eq!(syn_ack, 0x11);
-        assert_ne!(syn_ack & FLAG_SYN, 0);
-        assert_ne!(syn_ack & FLAG_ACK, 0);
-        assert_eq!(syn_ack & FLAG_DATA, 0);
     }
 }

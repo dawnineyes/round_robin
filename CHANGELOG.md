@@ -6,6 +6,43 @@
 
 ---
 
+## Phase 9: Bug 审查修复 + 背压重构 (v1.10.4)
+
+> **基线**: v1.10.3  
+> **来源**: 全量代码审查（12 个 bug + 优化项），对应审查报告中的 BUG-1~12 / O1~O4 / O8
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/reorder.rs` | `PushResult` 新增 `overflow` 标记；新增 `is_complete_through()`；新增单元测试 | BUG-2: 窗口满丢帧后序列永久断裂，需重置而非静默 |
+| `src/tunnel.rs` | 新增 `send_async()`（least-loaded 真实背压发送）；`drain_frames` 写超时 60s；新增 3 个测试 | BUG-5/O2: yield 重试是伪背压；BUG-9: 写阻塞无超时 |
+| `src/frame.rs` | `encode()` 长度 `debug_assert`；删除 `Frame::syn_ack()` 与 `FLAG_ACK` | BUG-8: u16 长度字段截断会毁流；O3: SYN+ACK 死代码 |
+| `src/reassembler.rs` | FIN 改为半关闭（`start_half_close`/`close_write_half`，10s 强制兜底）；重复 SYN 防护（`handshaking` 集合）；`closed` 墓碑集合（晚到 DATA 回 RST）；egress 通道改有界 512 + 写超时；accept 错误重试；隧道链路上限 64；UDP 超大报文丢弃；读缓冲复用 + `send_async` 背压；先 insert 后 spawn 消除竞态 | BUG-1/2/5/7/8/9/10/11/12 + O1/O3 |
+| `src/splitter.rs` | FIN/RST 半关闭配合（`rst` 标记 + close_reason=rst）；溢出即重置并回 RST；UDP 出站刷新 `last_active`；单 UDP 客户端守卫 + `remove_if`；UDP 循环监听 notify；客户端通道改有界 512/1024；`writer_task` 写超时；先 insert 后发 SYN；`send_async` 背压 + 读缓冲复用；重连指数退避 3→24s；删除 SYN+ACK 忽略分支 | BUG-2/3/4/5/6/9 + O1/O3/O4 |
+| `Cargo.toml` | 版本 1.10.3 → 1.10.4 | 发布 |
+| `README.md` | reassembler `chunk_size` 默认值修正为 65535；协议节补充 FIN 半关闭语义 | O8 |
+
+### 行为变化
+
+- **修复**: 客户端半关闭（发完请求即关写端）不再导致服务器尾响应丢失——FIN 触发 egress 写端精确半关闭，读端持续到服务器 EOF 才回 FIN
+- **修复**: 重排窗口溢出不再让连接静默挂死——立即重置并回 RST（原来只是统计不虚高，连接仍永久阻塞）
+- **修复**: 纯单向 UDP 客户端不再被 60s idle 误杀；并发 UDP ASSOCIATE 不再互相覆盖
+- **修复**: 重复 SYN 不再泄漏 egress 连接；SYN 发出前 conn 已注册，早期 RST 不再丢失
+- **修复**: 隧道/egress/客户端写均带 60s 超时，对端卡死不阻塞任务；reassembler accept 瞬态错误不再杀死监听
+- **改进**: DATA 发送改为真实背压（等待隧道容量，30s 超时兜底）并按队列余量选隧道；客户端/egress 通道有界（512），慢客户端触发重置而非 OOM
+- **改进**: 晚到 DATA 对已关闭 conn 回 RST（closed 墓碑 60s），不再积压 30s 僵尸 pending 条目
+- **改进**: 每帧 payload 精确分配（复用读缓冲），在途帧不再携带 64KB 底座
+- **移除**: SYN+ACK 帧（splitter 从不使用）
+
+### 测试结果
+
+- `cargo test`: 15/15 passed（新增 reorder 1 个、tunnel 3 个，移除 flags_composition 1 个）
+- `cargo clippy --all-targets`: 0 warnings
+- `cargo build --release`: 成功
+
+---
+
 ## Phase 8: 线上分析 Bug 修复 (2026-07-28)
 
 > **基线**: v1.10.0  

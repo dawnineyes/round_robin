@@ -1,12 +1,11 @@
 use crate::frame::{
-    self, FLAG_ACK, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, SynTarget,
-    UDP_CONN_ID,
+    self, FLAG_DATA, FLAG_FIN, FLAG_RST, Frame, FrameDecoder, SynTarget, UDP_CONN_ID,
 };
 use crate::reorder::ReorderBuf;
 use crate::socks5;
 use crate::tunnel::{TUNNEL_CHANNEL_CAP, TunnelLink, TunnelPool, drain_frames};
 use anyhow::{Result, bail};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,14 +36,27 @@ pub struct TunnelEndpoint {
 
 // ── Virtual connection (splitter side) ────────────────────────────────
 
+/// Client-facing channel capacity. ~32 MB worst-case backlog per TCP
+/// connection before the connection is reset (bounded — no OOM).
+const CLIENT_CHANNEL_CAP: usize = 512;
+/// UDP relay channel capacity (datagrams are usually small).
+const UDP_CHANNEL_CAP: usize = 1024;
+/// A client/egress write stalled for this long is a dead peer — give up.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// DATA send timeout: no live tunnel can take the frame within this
+/// window → the connection cannot proceed.
+const DATA_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct VirtConn {
-    to_client_tx: mpsc::UnboundedSender<Bytes>,
+    to_client_tx: mpsc::Sender<Bytes>,
     reorder: Mutex<ReorderBuf>,
     /// Woken on FIN/RST so the client read loop can exit.
     notify: tokio::sync::Notify,
     closed: AtomicBool,
     /// FIN received from reassembler (close initiated remotely).
     fin_received: AtomicBool,
+    /// Reset received or triggered locally (reorder/channel overflow).
+    rst: AtomicBool,
     created_at: Instant,
     last_active: Mutex<Instant>,
     bytes_sent: AtomicU64,
@@ -54,19 +66,26 @@ struct VirtConn {
 }
 
 impl VirtConn {
-    fn on_frame(&self, seq: u64, payload: Bytes) {
+    /// Returns true when the connection must be reset: either the
+    /// reorder window overflowed (sequence permanently broken) or the
+    /// client channel is full/closed (client can't keep up).
+    fn on_frame(&self, seq: u64, payload: Bytes) -> bool {
         let plen = payload.len() as u64;
         let result = self.reorder.lock().unwrap().push(seq, payload);
         if !result.accepted {
-            // Duplicate or buffer-full drop — don't update stats.
-            return;
+            // Duplicate or window-overflow drop — don't update stats.
+            return result.overflow;
         }
+        let mut overflow = false;
         for chunk in result.ready {
-            let _ = self.to_client_tx.send(chunk);
+            if self.to_client_tx.try_send(chunk).is_err() {
+                overflow = true;
+            }
         }
         self.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         self.frames_recv.fetch_add(1, Ordering::Relaxed);
         *self.last_active.lock().unwrap() = Instant::now();
+        overflow
     }
 }
 
@@ -148,7 +167,15 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                     info!(tunnel = i, "shutting down tunnel reconnect loop");
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                // O4: 3s cadence after a session that ran and ended,
+                // exponential backoff (3→6→12→24s) on repeated connect
+                // failures so a dead peer isn't hammered.
+                let delay_secs = if retry_count == 0 {
+                    3
+                } else {
+                    std::cmp::min(24u64, 3u64 << (retry_count - 1).min(3))
+                };
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
         });
     }
@@ -340,13 +367,6 @@ fn handle_inbound_frame(
     pool: &TunnelPool,
     time_wait: &DashMap<u32, Instant>,
 ) {
-    if frame.flags & FLAG_SYN != 0 && frame.flags & FLAG_ACK != 0 {
-        // SYN+ACK: handshake complete — handled by the pending oneshot in handle_client
-        // Frame just arrives; the oneshot is triggered elsewhere after the initial SYN is sent.
-        // ponytail: SYN+ACK frames are no-ops here; handle_client manages the handshake directly.
-        return;
-    }
-
     // Ignore control frames (FIN/RST/SYN) for UDP relay; only DATA is valid.
     if frame.conn_id == UDP_CONN_ID && frame.flags & FLAG_DATA == 0 {
         return;
@@ -354,7 +374,25 @@ fn handle_inbound_frame(
 
     if frame.flags & FLAG_DATA != 0 {
         if let Some(conn) = conns.get(&frame.conn_id) {
-            conn.on_frame(frame.seq, frame.payload);
+            let overflow = conn.on_frame(frame.seq, frame.payload);
+            drop(conn); // release the shard lock before remove()
+            if overflow {
+                // Reorder window overflow or client channel full: the
+                // sequence is broken — reset instead of stalling.
+                warn!(
+                    conn_id = frame.conn_id,
+                    seq = frame.seq,
+                    "reorder/channel overflow, resetting connection"
+                );
+                if let Some((_, conn)) = conns.remove(&frame.conn_id) {
+                    time_wait.insert(frame.conn_id, Instant::now());
+                    conn.rst.store(true, Ordering::Release);
+                    conn.closed.store(true, Ordering::Release);
+                    conn.notify.notify_one();
+                    drop(conn);
+                }
+                pool.send(Frame::rst(frame.conn_id));
+            }
         } else if time_wait.contains_key(&frame.conn_id) {
             // Late DATA arrived after FIN but before TIME_WAIT expiry.
             // This means the FIN_GRACE period was too short for this path.
@@ -388,15 +426,12 @@ fn handle_inbound_frame(
         // RST = force-close, no grace period needed.
         if let Some((_, conn)) = conns.remove(&frame.conn_id) {
             time_wait.insert(frame.conn_id, Instant::now());
+            conn.rst.store(true, Ordering::Release);
             conn.closed.store(true, Ordering::Release);
             conn.notify.notify_one();
             drop(conn);
         }
-        return;
     }
-
-    // ACK frames are ignored — TCP backpressure replaces application flow control.
-    let _ = frame.flags & FLAG_ACK;
 }
 
 // ── Client handler ────────────────────────────────────────────────────
@@ -462,17 +497,14 @@ async fn handle_tcp_client(
     };
     let syn_frame = Frame::syn(conn_id, syn_target.encode());
 
-    if !pool.send(syn_frame) {
-        bail!("no live tunnels to send SYN");
-    }
-
-    let (to_client_tx, to_client_rx) = mpsc::unbounded_channel();
+    let (to_client_tx, to_client_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_CAP);
     let vconn = Arc::new(VirtConn {
         to_client_tx,
         reorder: Mutex::new(ReorderBuf::new()),
         notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         fin_received: AtomicBool::new(false),
+        rst: AtomicBool::new(false),
         created_at: Instant::now(),
         last_active: Mutex::new(Instant::now()),
         bytes_sent: AtomicU64::new(0),
@@ -480,16 +512,27 @@ async fn handle_tcp_client(
         frames_sent: AtomicU64::new(0),
         frames_recv: AtomicU64::new(0),
     });
-    let vconn2 = vconn.clone();
-    conns.insert(conn_id, vconn2);
+    // BUG-6: insert BEFORE sending the SYN so an early RST (egress
+    // connect failure on the reassembler) can't slip through the gap
+    // and leave the client hanging on a dead connection.
+    conns.insert(conn_id, vconn.clone());
+
+    if !pool.send(syn_frame) {
+        conns.remove(&conn_id);
+        bail!("no live tunnels to send SYN");
+    }
 
     let (mut client_reader, mut client_writer) = accepted.stream.into_split();
 
     let writer_task = tokio::spawn(async move {
         let mut rx = to_client_rx;
         while let Some(chunk) = rx.recv().await {
-            if client_writer.write_all(&chunk).await.is_err() {
-                break;
+            // BUG-9: a peer that reads nothing must not block this task
+            // forever — give up after CLIENT_WRITE_TIMEOUT.
+            match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, client_writer.write_all(&chunk)).await
+            {
+                Ok(Ok(())) => {}
+                _ => break,
             }
         }
         let _ = client_writer.shutdown().await;
@@ -497,34 +540,28 @@ async fn handle_tcp_client(
 
     let mut seq: u64 = 1;
     let close_reason: &str;
+    // O1: one reusable read buffer per connection; each frame copies
+    // exactly n bytes into a fresh Bytes (no 64 KB backing per frame).
+    let mut buf = vec![0u8; chunk_size];
     loop {
-        // read_buf reads directly into BytesMut, allocating only what
-        // the TCP stream delivers.  freeze() converts to Bytes with zero
-        // copy — no separate allocation and no copy_from_slice.
-        let mut buf = BytesMut::with_capacity(chunk_size);
         // Race client read against close notification.
         tokio::select! {
-            result = client_reader.read_buf(&mut buf) => {
+            result = client_reader.read(&mut buf) => {
                 match result {
                     Ok(0) => {
                         close_reason = "eof";
                         break;
                     }
                     Ok(n) => {
-                        let frame = Frame::data(conn_id, seq, buf.freeze());
-                        // Backpressure: if all tunnel channels are full, yield
-                        // briefly to let drain_frames catch up instead of
-                        // immediately killing the connection.
-                        let mut sent = false;
-                        for _ in 0..10 {
-                            if pool.send(frame.clone()) {
-                                sent = true;
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        }
+                        let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
+                        // BUG-5: real backpressure — wait for a tunnel to
+                        // take the frame instead of killing the connection
+                        // after a few microsecond yields.
+                        let sent = tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(frame))
+                            .await
+                            .unwrap_or(false);
                         if !sent {
-                            warn!(conn_id, "no live tunnels after retries, aborting");
+                            warn!(conn_id, "no live tunnels after timeout, aborting");
                             close_reason = "no_tunnel";
                             break;
                         }
@@ -542,7 +579,9 @@ async fn handle_tcp_client(
             }
             _ = vconn.notify.notified() => {
                 if vconn.closed.load(Ordering::Acquire) {
-                    close_reason = if vconn.fin_received.load(Ordering::Acquire) {
+                    close_reason = if vconn.rst.load(Ordering::Acquire) {
+                        "rst"
+                    } else if vconn.fin_received.load(Ordering::Acquire) {
                         "remote_fin"
                     } else {
                         "timeout"
@@ -554,7 +593,10 @@ async fn handle_tcp_client(
         }
     }
 
-    pool.send(Frame::fin(conn_id, seq));
+    // FIN carries next_seq so the reassembler can half-close its egress
+    // write side exactly when every in-flight frame has been delivered.
+    let _ =
+        tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(Frame::fin(conn_id, seq))).await;
     // Grace period: wait for late DATA frames on other tunnels before
     // removing from conns.  Without this, a FIN arriving on tunnel A
     // would cause DATA frames still in-flight on tunnel B to trigger
@@ -600,13 +642,22 @@ async fn handle_udp_client(
     let relay_addr = relay.local_addr()?;
     info!(addr = %relay_addr, "UDP relay started");
 
-    let (to_udp_tx, mut to_udp_rx) = mpsc::unbounded_channel::<Bytes>();
+    // BUG-4: all UDP clients share UDP_CONN_ID — a second association
+    // would overwrite the first one's entry and misroute its responses.
+    // Reject instead (single-client proxy).
+    if conns.contains_key(&UDP_CONN_ID) {
+        warn!("second UDP ASSOCIATE rejected — only one relay at a time");
+        return Ok(());
+    }
+
+    let (to_udp_tx, mut to_udp_rx) = mpsc::channel::<Bytes>(UDP_CHANNEL_CAP);
     let vconn = Arc::new(VirtConn {
         to_client_tx: to_udp_tx,
         reorder: Mutex::new(ReorderBuf::new()),
         notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         fin_received: AtomicBool::new(false),
+        rst: AtomicBool::new(false),
         created_at: Instant::now(),
         last_active: Mutex::new(Instant::now()),
         bytes_sent: AtomicU64::new(0),
@@ -614,7 +665,7 @@ async fn handle_udp_client(
         frames_sent: AtomicU64::new(0),
         frames_recv: AtomicU64::new(0),
     });
-    conns.insert(UDP_CONN_ID, vconn);
+    conns.insert(UDP_CONN_ID, vconn.clone());
 
     // Track SOCKS5 client address so we can send_to (socket is unconnected).
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -671,14 +722,26 @@ async fn handle_udp_client(
                     warn!("UDP relay: no live tunnels, dropping datagram");
                     continue;
                 }
+                // BUG-3: outbound traffic must also count as activity,
+                // otherwise a send-only client (e.g. unanswered DNS) is
+                // swept by the 60s idle timeout.
+                *vconn.last_active.lock().unwrap() = Instant::now();
                 seq = seq.wrapping_add(1);
             }
             _ = &mut ka_rx => {
                 info!("UDP keepalive closed, ending relay");
                 break;
             }
+            _ = vconn.notify.notified() => {
+                // Swept by heartbeat / reset — stop the relay loop.
+                if vconn.closed.load(Ordering::Acquire) {
+                    info!("UDP relay closed by heartbeat/reset, ending relay");
+                    break;
+                }
+            }
         }
     }
-    conns.remove(&UDP_CONN_ID);
+    // BUG-4: only remove our own entry — never a newer relay's.
+    conns.remove_if(&UDP_CONN_ID, |_, v| Arc::ptr_eq(v, &vconn));
     Ok(())
 }
