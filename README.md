@@ -39,7 +39,7 @@ curl -sSfL https://raw.githubusercontent.com/dawnineyes/round_robin/master/insta
 sudo systemctl restart round_robin
 ```
 
-安装指定版本（默认安装最新 release，如 `v1.10.10`）：
+安装指定版本（默认安装最新 release，如 `v1.10.11`）：
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/dawnineyes/round_robin/master/install.sh | bash -s -- v1.10.4
@@ -67,6 +67,8 @@ local_target = "127.0.0.1:52040"
 |------|------|------|
 | `listen` | SocketAddr | SOCKS5 入站地址 |
 | `chunk_size` | usize | 分片大小 512-65535，默认 65535 |
+| `data_send_timeout_secs` | u64 | DATA 发送超时（秒），超时即重置连接，默认 30 |
+| `heartbeat_secs` | u64 | 心跳/连接清扫间隔（秒），默认 60 |
 | `[[splitter.tunnel]]` | array | 隧道列表 |
 | `tunnel.proxy` | SocketAddr | sing-box SOCKS5 入站地址 |
 | `tunnel.target` | String | Reassembler IP |
@@ -80,6 +82,8 @@ local_target = "127.0.0.1:52040"
 | `ports` | range/list | 监听端口 |
 | `local_target` | SocketAddr | 出站 SOCKS5 目标 |
 | `chunk_size` | usize | 分片大小，默认 65535 |
+| `data_send_timeout_secs` | u64 | DATA 发送超时（秒），默认 30 |
+| `heartbeat_secs` | u64 | 心跳/连接清扫间隔（秒），默认 60 |
 
 ## 协议
 

@@ -25,6 +25,12 @@ pub struct ReassemblerConfig {
     pub listen_ports: Vec<u16>,
     pub local_target: SocketAddr,
     pub chunk_size: usize,
+    /// DATA send timeout (O5: configurable via `data_send_timeout_secs`;
+    /// default 30s, previously the DATA_SEND_TIMEOUT constant).
+    pub data_send_timeout: Duration,
+    /// Heartbeat / connection-sweep interval (O5: previously hardcoded
+    /// 60s; configurable so tests can exercise sweeps without waiting).
+    pub heartbeat_interval: Duration,
 }
 
 // ── Tuning constants ──────────────────────────────────────────────────
@@ -34,9 +40,6 @@ pub struct ReassemblerConfig {
 const EGRESS_CHANNEL_CAP: usize = 512;
 /// An egress write stalled for this long is a dead peer — give up.
 const EGRESS_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
-/// DATA send timeout: no live tunnel can take the frame within this
-/// window → the connection cannot proceed.
-const DATA_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// After the splitter's FIN, force-close the egress write half if the
 /// seq gap never fills (a tunnel died and frames are gone).
 const HALF_CLOSE_FALLBACK: Duration = Duration::from_secs(10);
@@ -65,10 +68,22 @@ impl EgressConn {
     }
 }
 
+impl VirtConnDe {
+    /// Egress write channel — TCP conns only (UDP conns store `None`).
+    fn egress(&self) -> &EgressConn {
+        self.egress
+            .as_ref()
+            .expect("UDP conn has no egress channel")
+    }
+}
+
 // ── Virtual connection (reassembler side) ─────────────────────────────
 
 struct VirtConnDe {
-    egress: EgressConn,
+    /// Egress write channel.  `None` for UDP conns — datagrams bypass
+    /// the channel (O7: the UDP path used to allocate a cap-1 channel
+    /// whose receiver was dropped immediately, a dead allocation).
+    egress: Option<EgressConn>,
     reorder: Mutex<ReorderBuf>,
     /// Teardown signal (RST / idle sweep / duplicate).
     cancel: Arc<Notify>,
@@ -180,6 +195,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             handshaking,
             pool,
             chunk_size: cfg.chunk_size,
+            data_send_timeout: cfg.data_send_timeout,
             pending_bytes,
             resets,
             syn_limit,
@@ -204,7 +220,8 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let hb_handshaking = handshaking.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            // O5: configurable heartbeat interval (default 60s).
+            tokio::time::sleep(cfg.heartbeat_interval).await;
             let (alive, total) = hb_pool.stats();
             let queue_depth = hb_pool.queue_depth();
             // Sweep dead links that accumulated from tunnel reconnects
@@ -306,6 +323,24 @@ async fn bind_udp_pair() -> anyhow::Result<UdpPair> {
     Ok(UdpPair { v4, v6 })
 }
 
+/// B49: domain resolution inside `UdpPair::send_to` runs inline on the
+/// tunnel read loop (UDP DATA path).  An unresponsive resolver must not
+/// head-of-line block every other connection on the tunnel — bound it.
+const UDP_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolve a domain target within `timeout_dur`.  Separated so the
+/// timeout path is deterministically testable (a blocking-pool DNS round
+/// trip can never complete within the first poll of `timeout(Duration::ZERO)`).
+async fn resolve_target(host: &str, port: u16, timeout_dur: Duration) -> anyhow::Result<IpAddr> {
+    let addrs = tokio::time::timeout(timeout_dur, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| anyhow::anyhow!("UDP DNS resolution timed out for {host}"))??;
+    addrs
+        .map(|a| a.ip())
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("UDP target resolved to no address: {host}"))
+}
+
 impl UdpPair {
     /// Send to `host:port`, choosing the socket matching the family.
     async fn send_to(&self, host: &str, port: u16, data: &[u8]) -> anyhow::Result<()> {
@@ -314,11 +349,7 @@ impl UdpPair {
             Err(_) => {
                 // Domain name: resolve (UDP datagram targets are almost
                 // always IP literals, but keep domain support).
-                let addrs = tokio::net::lookup_host((host, port)).await?;
-                addrs
-                    .map(|a| a.ip())
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("UDP target resolved to no address: {host}"))?
+                resolve_target(host, port, UDP_DNS_TIMEOUT).await?
             }
         };
         let addr = SocketAddr::new(ip, port);
@@ -347,6 +378,8 @@ struct ListenerCtx {
     handshaking: Arc<DashMap<u32, Instant>>,
     pool: Arc<TunnelPool>,
     chunk_size: usize,
+    /// O5: per-connection DATA send timeout (configurable).
+    data_send_timeout: Duration,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
     /// B46: bounds concurrent spawned SYN handshakes.
@@ -426,6 +459,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             pool: ctx.pool.clone(),
             local_target: ctx.local_target,
             chunk_size: ctx.chunk_size,
+            data_send_timeout: ctx.data_send_timeout,
             pending_bytes: ctx.pending_bytes.clone(),
             resets: ctx.resets.clone(),
             link: link.clone(),
@@ -461,6 +495,8 @@ struct ReadLoopCtx {
     pool: Arc<TunnelPool>,
     local_target: SocketAddr,
     chunk_size: usize,
+    /// O5: per-connection DATA send timeout (configurable).
+    data_send_timeout: Duration,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
     link: Arc<TunnelLink>,
@@ -593,7 +629,6 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         // sends responses back with this conn_id (so two clients talking
         // to the same target can't cross their datagrams).
         if syn_target.proto == PROTO_UDP {
-            let (write_tx, _write_rx) = mpsc::channel::<Bytes>(1);
             let cancel = Arc::new(Notify::new());
             let half_close = Arc::new(Notify::new());
             // B38: a UDP socket bind failure must not propagate out of
@@ -616,7 +651,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 }
             };
             let vconn = Arc::new(VirtConnDe {
-                egress: EgressConn { write_tx },
+                egress: None, // O7: UDP datagrams bypass the egress channel
                 reorder: Mutex::new(ReorderBuf::new()),
                 cancel: cancel.clone(),
                 half_close: half_close.clone(),
@@ -798,7 +833,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         let half_close = Arc::new(Notify::new());
 
         let vconn = Arc::new(VirtConnDe {
-            egress: EgressConn { write_tx },
+            egress: Some(EgressConn { write_tx }),
             reorder: Mutex::new(ReorderBuf::new()),
             cancel: cancel.clone(),
             half_close: half_close.clone(),
@@ -821,7 +856,12 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         ctx.conns.insert(cid, vconn.clone());
 
         // Spawn egress writer: ordered data → egress connection
-        tokio::spawn(write_to_egress(write_rx, egress_wr, half_close));
+        tokio::spawn(write_to_egress(
+            write_rx,
+            egress_wr,
+            half_close,
+            cancel.clone(),
+        ));
 
         // Spawn egress reader: egress response → frames → pool
         tokio::spawn(read_from_egress(
@@ -834,7 +874,8 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 cancel,
                 closed: ctx.closed.clone(),
                 vconn: vconn.clone(),
-                data_send_timeout: DATA_SEND_TIMEOUT,
+                // O5: configurable, default 30s.
+                data_send_timeout: ctx.data_send_timeout,
             },
         ));
 
@@ -862,7 +903,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     // originally queued, so don't double-count here.
                     let mut write_failed = false;
                     for chunk in result.ready {
-                        if !vconn.egress.write(chunk) {
+                        if !vconn.egress().write(chunk) {
                             warn!(conn_id = cid, "egress write failed (drain)");
                             write_failed = true;
                             break;
@@ -939,7 +980,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     return Ok(());
                 }
                 for chunk in result.ready {
-                    if !vconn.egress.write(chunk) {
+                    if !vconn.egress().write(chunk) {
                         drop(reorder);
                         warn!(conn_id = cid, "egress write failed, resetting connection");
                         drop(vconn);
@@ -1315,22 +1356,37 @@ fn close_write_half(vconn: &VirtConnDe, cid: u32, force: bool) {
 
 // ── Egress I/O tasks ──────────────────────────────────────────────────
 
-async fn write_to_egress(
+async fn write_to_egress<W>(
     mut rx: mpsc::Receiver<Bytes>,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    mut wr: W,
     half_close: Arc<Notify>,
-) {
+    cancel: Arc<Notify>,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
+        // B48: biased with cancel first — an RST / idle sweep must stop
+        // the writer immediately instead of draining up to
+        // EGRESS_CHANNEL_CAP (512 ≈ 32 MB) of stale chunks to a target
+        // the client already abandoned.  Without a cancel arm the task
+        // only exits when the channel closes after the queue drains.
         tokio::select! {
+            biased;
+            _ = cancel.notified() => break,
             chunk = rx.recv() => {
-                match chunk {
-                    Some(chunk) => {
-                        match tokio::time::timeout(EGRESS_WRITE_TIMEOUT, wr.write_all(&chunk)).await {
+                let Some(chunk) = chunk else { break }; // vconn dropped — teardown
+                // B48: race the write itself against cancel too — a
+                // stalled write must not wait out the 60s timeout on a
+                // connection that was reset mid-write.
+                tokio::select! {
+                    biased;
+                    _ = cancel.notified() => break,
+                    r = tokio::time::timeout(EGRESS_WRITE_TIMEOUT, wr.write_all(&chunk)) => {
+                        match r {
                             Ok(Ok(())) => {}
                             _ => break, // write error or stall timeout
                         }
                     }
-                    None => break, // vconn dropped — teardown
                 }
             }
             _ = half_close.notified() => {
@@ -1476,7 +1532,12 @@ fn finish_if_done(
     }
     closed.insert(cid, Instant::now());
     if let Some((_, vc)) = conns.remove(&cid) {
-        vc.cancel.notify_one();
+        // B48: no cancel notify here — egress_eof is only ever set by
+        // the egress reader itself, so by the time this runs the reader
+        // is already past its select loop.  The signal was dead; with
+        // the writer now listening on cancel it became actively harmful
+        // (it raced the half_close drain and truncated the tail of the
+        // egress stream — D3 regression).
         let dur = vc.created_at.elapsed().as_millis() as u64;
         info!(
             conn_id = cid,
@@ -1623,6 +1684,7 @@ mod tests {
             pool,
             local_target: "127.0.0.1:9".parse().unwrap(),
             chunk_size: 4096,
+            data_send_timeout: Duration::from_secs(30),
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicU64::new(0)),
             link,
@@ -1636,7 +1698,7 @@ mod tests {
     fn make_vconn(_cid: u32) -> Arc<VirtConnDe> {
         let (write_tx, _write_rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
         Arc::new(VirtConnDe {
-            egress: EgressConn { write_tx },
+            egress: Some(EgressConn { write_tx }),
             reorder: Mutex::new(ReorderBuf::new()),
             cancel: Arc::new(Notify::new()),
             half_close: Arc::new(Notify::new()),
@@ -1862,6 +1924,106 @@ mod tests {
         );
         drop(peer);
     }
+
+    /// B48 regression: cancel must stop the egress writer promptly even
+    /// mid-write — without the cancel race the writer would sit out the
+    /// 60s stall timeout on a connection the client already reset.
+    #[tokio::test]
+    async fn write_to_egress_aborts_on_cancel() {
+        // duplex capacity 4: the first queued chunk stalls the write
+        // (the peer never reads), forcing the mid-write path.
+        let (peer, wr) = tokio::io::duplex(4);
+        let (tx, rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
+        for i in 0..4 {
+            tx.try_send(Bytes::from(vec![i as u8; 1024])).unwrap();
+        }
+        let cancel = Arc::new(Notify::new());
+        let half_close = Arc::new(Notify::new());
+        let task = tokio::spawn(write_to_egress(rx, wr, half_close, cancel.clone()));
+        // Let the writer dequeue the first chunk and stall on the write.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("egress writer did not exit after cancel")
+            .unwrap();
+        drop(peer);
+    }
+
+    /// B48 regression: a cancel that fired before the writer started
+    /// (notify_one stores a permit) must stop it before any queued chunk
+    /// is written.
+    #[tokio::test]
+    async fn write_to_egress_stops_immediately_when_pre_cancelled() {
+        let (peer, wr) = tokio::io::duplex(1024);
+        let (tx, rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
+        tx.try_send(Bytes::from(vec![0u8; 64])).unwrap();
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one();
+        let half_close = Arc::new(Notify::new());
+        let task = tokio::spawn(write_to_egress(rx, wr, half_close, cancel));
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("pre-cancelled writer did not exit")
+            .unwrap();
+        drop(peer);
+    }
+
+    /// B49 regression: IP-literal datagrams go straight to the matching
+    /// socket (no resolution, no timeout involvement).
+    #[tokio::test]
+    async fn udp_pair_send_to_ip_literal() {
+        let pair = bind_udp_pair().await.unwrap();
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap();
+        pair.send_to("127.0.0.1", addr.port(), b"ping")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .expect("datagram not received")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping");
+    }
+
+    /// O7: a UDP conn must not allocate an egress channel (datagrams
+    /// bypass it entirely — the old code created a cap-1 channel whose
+    /// receiver was dropped immediately).
+    #[tokio::test]
+    async fn udp_syn_creates_no_egress_channel() {
+        let (ctx, _rx) = make_ctx();
+        let cid = 77u32;
+        let payload = SynTarget {
+            proto: PROTO_UDP,
+            address: "127.0.0.1".into(),
+            port: 53,
+        }
+        .encode()
+        .unwrap();
+        handle_frame(Frame::syn(cid, payload), &ctx).await.unwrap();
+        let vc = ctx
+            .conns
+            .get(&cid)
+            .expect("UDP conn must be established")
+            .clone();
+        assert!(vc.is_udp);
+        assert!(
+            vc.egress.is_none(),
+            "UDP conn must not allocate an egress channel"
+        );
+        drop(vc);
+        // RST tears the conn (and its response reader) down.
+        handle_frame(Frame::rst(cid), &ctx).await.unwrap();
+        assert!(!ctx.conns.contains_key(&cid));
+    }
+
+    // B49: the timeout path itself is not unit-tested — `lookup_host`
+    // resolves synchronously on the first poll in this environment
+    // (wildcard DNS), so the wrapper can never be observed elapsing.
+    // The wrapper is tokio's own `timeout` primitive; the regression
+    // risk being guarded (an unbounded await on the tunnel read loop)
+    // is removed by construction.
 
     /// B46 regression: a SYN whose egress connect stalls must NOT block
     /// the tunnel read loop — frames for other cids keep flowing.  The

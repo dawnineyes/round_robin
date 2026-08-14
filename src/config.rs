@@ -31,6 +31,13 @@ pub struct SplitterConfig {
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
     pub tunnel: Vec<Tunnel>,
+    /// DATA send timeout: no live tunnel can take a frame within this
+    /// window → the connection cannot proceed (O5, was a hardcoded 30s).
+    #[serde(default = "default_data_send_timeout")]
+    pub data_send_timeout_secs: u64,
+    /// Heartbeat / connection-sweep interval in seconds (O5).
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +50,21 @@ pub struct ReassemblerConfig {
     pub local_target: SocketAddr,
     #[serde(default = "default_chunk")]
     pub chunk_size: usize,
+    /// DATA send timeout, same semantics as the splitter's (O5).
+    #[serde(default = "default_data_send_timeout")]
+    pub data_send_timeout_secs: u64,
+    /// Heartbeat / connection-sweep interval in seconds (O5; the
+    /// reassembler previously hardcoded 60s).
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u64,
+}
+
+fn default_data_send_timeout() -> u64 {
+    30
+}
+
+fn default_heartbeat() -> u64 {
+    60
 }
 
 fn default_listen_ip() -> std::net::IpAddr {
@@ -193,5 +215,45 @@ mod tests {
     fn parse_ports_rejects_huge_range() {
         let ports = Ports::Range("1-65535".into());
         assert!(parse_ports(&ports).is_err());
+    }
+
+    /// O5: the new timeout fields default and parse from TOML.
+    #[test]
+    fn timeout_fields_default_and_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+tunnel = [{ proxy = "127.0.0.1:1080", target = "127.0.0.1", port = 1 }]
+
+[reassembler]
+"#,
+        )
+        .unwrap();
+        let sc = cfg.splitter.unwrap();
+        assert_eq!(sc.data_send_timeout_secs, 30);
+        assert_eq!(sc.heartbeat_secs, 60);
+        let rc = cfg.reassembler.unwrap();
+        assert_eq!(rc.data_send_timeout_secs, 30);
+        assert_eq!(rc.heartbeat_secs, 60);
+
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+data_send_timeout_secs = 5
+heartbeat_secs = 2
+tunnel = []
+
+[reassembler]
+data_send_timeout_secs = 7
+heartbeat_secs = 3
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.splitter.unwrap().data_send_timeout_secs, 5);
+        assert_eq!(cfg.reassembler.unwrap().heartbeat_secs, 3);
     }
 }

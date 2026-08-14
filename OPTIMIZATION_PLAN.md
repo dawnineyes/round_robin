@@ -7,7 +7,8 @@
 >
 > - **v1.10.5（已实施）**：P0（F1/F2/F3）✅；P1（F4–F9）✅；P2 的 B9/B11–B18/B20 ✅
 > - **v1.10.6（已实施）**：D1 隧道故障快恢复 ✅（drain_frames 上报丢失帧 → splitter 重置连接/重发控制帧、reassembler 回 RST）；D3 splitter 侧半关闭 ✅（远端 FIN 后继续转发，egress 保留至双方 FIN，`finish_if_done` 三条件拆除）；O1 ✅（read_buf 零拷贝解码）；O2 ✅（drain_frames 复用编码缓冲）；O4 ✅（codegen-units=1 + strip）；E1 ✅（CI clippy -D warnings + 全量测试 + release 门槛）；E5 ✅（示例端口统一 52030-52040 段）；可观测性 ✅（心跳 resets/queue_depth/half_open/time_wait）；新增 D1/D3 端到端回归测试（e2e 共 4 个）
-> - **仍开放**：O3（send_async 选择器优化，当前实现正确、收益有限）、O5（超时可配置化）、E2/E3（常量集中/统计字段抽取，纯重构）、E4（启动自检）、Prometheus 端点、D4（UDP ICMP 透传）
+> - **v1.10.11（已实施，Phase 16）**：O5 超时可配置化 ✅（`data_send_timeout_secs`/`heartbeat_secs`，splitter + reassembler）、O6 queue_depth 只计活链路 ✅、O7 UDP vconn 死通道清理 ✅；详见 `OPTIMIZATION_PLAN_v11010.md`
+> - **仍开放**：O3（send_async 选择器优化，当前实现正确、收益有限）、E2/E3（常量集中/统计字段抽取，纯重构）、E4（启动自检）、Prometheus 端点、D4（UDP ICMP 透传）、其余超时常量可配置化（O5 模式已铺好）
 
 ## 优先级总览
 

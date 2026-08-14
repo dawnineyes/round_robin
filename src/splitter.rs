@@ -25,6 +25,9 @@ pub struct SplitterConfig {
     /// Heartbeat / connection-sweep interval (B21: configurable so tests
     /// can exercise sweep races without waiting a full minute).
     pub heartbeat_interval: Duration,
+    /// DATA send timeout (O5: configurable via `data_send_timeout_secs`;
+    /// default 30s, previously the DATA_SEND_TIMEOUT constant).
+    pub data_send_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -46,9 +49,6 @@ const CLIENT_CHANNEL_CAP: usize = 512;
 const UDP_CHANNEL_CAP: usize = 1024;
 /// A client/egress write stalled for this long is a dead peer — give up.
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
-/// DATA send timeout: no live tunnel can take the frame within this
-/// window → the connection cannot proceed.
-const DATA_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// SOCKS5 handshake timeout (BUG-6): a peer that stalls mid-handshake
 /// must not pin a task and a socket forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -451,6 +451,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 conns: conns.clone(),
                 time_wait: time_wait.clone(),
                 chunk_size: cfg.chunk_size,
+                data_send_timeout: cfg.data_send_timeout,
                 udp_sent: us,
                 udp_recv: ur,
                 half_open,
@@ -626,6 +627,8 @@ struct ClientCtx {
     conns: ConnMap,
     time_wait: Arc<DashMap<u32, Instant>>,
     chunk_size: usize,
+    /// O5: per-connection DATA send timeout (configurable).
+    data_send_timeout: Duration,
     udp_sent: Arc<AtomicU64>,
     udp_recv: Arc<AtomicU64>,
     half_open: Arc<AtomicUsize>,
@@ -704,6 +707,7 @@ async fn handle_tcp_client(
         ..
     } = ctx;
     let chunk_size = ctx.chunk_size;
+    let data_send_timeout = ctx.data_send_timeout;
     info!(conn_id, peer = %peer, target = %accepted.target.address, port = accepted.target.port, "accepted");
 
     let syn_target = SynTarget {
@@ -784,7 +788,7 @@ async fn handle_tcp_client(
                         // BUG-5: real backpressure — wait for a tunnel to
                         // take the frame instead of killing the connection
                         // after a few microsecond yields.
-                        let sent = tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(frame))
+                        let sent = tokio::time::timeout(data_send_timeout, pool.send_async(frame))
                             .await
                             .unwrap_or(false);
                         if !sent {
@@ -827,7 +831,7 @@ async fn handle_tcp_client(
     let fin_sent = if close_reason == "rst" {
         false
     } else {
-        tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(Frame::fin(conn_id, seq)))
+        tokio::time::timeout(data_send_timeout, pool.send_async(Frame::fin(conn_id, seq)))
             .await
             .unwrap_or(false)
     };

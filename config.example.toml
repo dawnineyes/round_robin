@@ -7,6 +7,8 @@ log = true                        # 日滚动日志，默认 true；false 关闭
 [splitter]
 listen = "127.0.0.1:52030"
 # chunk_size = 65535           # 分片大小 (512-65535)，默认 65535
+# data_send_timeout_secs = 30  # DATA 发送超时（秒），超时即重置连接，默认 30
+# heartbeat_secs = 60          # 心跳/连接清扫间隔（秒），默认 60
 
 [[splitter.tunnel]]
 proxy = "127.0.0.1:52031"

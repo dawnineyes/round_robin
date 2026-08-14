@@ -86,7 +86,9 @@ async fn main() -> Result<()> {
                 listen_addr: sc.listen,
                 tunnels,
                 chunk_size: sc.chunk_size,
-                heartbeat_interval: std::time::Duration::from_secs(60),
+                // O5: both timeouts are configurable now (30s/60s defaults).
+                data_send_timeout: std::time::Duration::from_secs(sc.data_send_timeout_secs),
+                heartbeat_interval: std::time::Duration::from_secs(sc.heartbeat_secs),
             })
             .await
         }
@@ -107,6 +109,9 @@ async fn main() -> Result<()> {
                 listen_ports: ports,
                 local_target: rc.local_target,
                 chunk_size: rc.chunk_size,
+                // O5: configurable timeouts (30s/60s defaults).
+                data_send_timeout: std::time::Duration::from_secs(rc.data_send_timeout_secs),
+                heartbeat_interval: std::time::Duration::from_secs(rc.heartbeat_secs),
             })
             .await
         }

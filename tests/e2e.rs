@@ -361,6 +361,8 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
             listen_ports: tports.clone(),
             local_target: fast_proxy_addr,
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -388,6 +390,7 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
                 },
             ],
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
@@ -451,6 +454,8 @@ async fn tunnel_death_resets_affected_connection_fast() {
             listen_ports: tports.clone(),
             local_target: proxy_a_addr,
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -471,6 +476,7 @@ async fn tunnel_death_resets_affected_connection_fast() {
                 },
             ],
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
@@ -569,6 +575,8 @@ async fn client_keeps_sending_after_remote_fin() {
             listen_ports: tports.clone(),
             local_target: proxy_addr,
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -585,6 +593,7 @@ async fn client_keeps_sending_after_remote_fin() {
                 })
                 .collect(),
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
             // B21 regression: 2s heartbeat so the sweep would fire while
             // the client is still sending — pre-fix, the first sweep
             // after the FIN killed the conn and truncated the tail.
@@ -658,6 +667,8 @@ async fn udp_e2e_two_clients_relay_concurrently() {
             listen_ports: tports.clone(),
             local_target: fast_proxy_addr,
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -674,6 +685,7 @@ async fn udp_e2e_two_clients_relay_concurrently() {
                 })
                 .collect(),
             chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {

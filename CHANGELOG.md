@@ -6,6 +6,42 @@
 
 ---
 
+## Phase 16: 第五轮 Bug 审查修复 + 优化（v1.10.11）
+
+> **基线**: v1.10.10
+> **来源**: `BUG_REVIEW_v11010.md`（B47–B49）+ `OPTIMIZATION_PLAN_v11010.md`（O5/O6/O7）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/tunnel.rs` | `send_async` 在每轮循环开头、pick **之前**创建 `added.notified()` future（tokio 保证创建于 `notify_waiters` 之前的 future 必被唤醒，pick 与等待注册之间的漏唤醒窗口消除）；`queue_depth` 过滤死链（死链关闭通道 capacity=0 曾按满深计入指标）；新增 2 个单测 | B47/O6 |
+| `src/reassembler.rs` | `write_to_egress` 增加 `cancel: Arc<Notify>`（biased 优先 + 与写操作竞争，RST/清扫即时停写，不再排空最多 32MB 陈旧数据）；移除 `finish_if_done` 中发给 egress reader 的死信号 `cancel.notify_one()`（writer 监听 cancel 后该信号会抢在 half-close 排空前截断 egress 流）；`UdpPair::send_to` 域名解析包 5s 超时（提取 `resolve_target`，DNS 卡住不再头部阻塞隧道读循环）；`VirtConnDe.egress` 改 `Option<EgressConn>`（UDP 关联不再分配死通道）；`ReassemblerConfig` 增加 `data_send_timeout`/`heartbeat_interval` 并贯穿 `ListenerCtx`/`ReadLoopCtx`；新增 4 个单测 | B48/B49/O5/O7 |
+| `src/splitter.rs` | `SplitterConfig` 增加 `data_send_timeout` 并贯穿 `ClientCtx`（客户端读循环 DATA/FIN 发送超时可配）；删除 `DATA_SEND_TIMEOUT` 常量 | O5 |
+| `src/config.rs` | `splitter`/`reassembler` 增加 `data_send_timeout_secs`（默认 30）与 `heartbeat_secs`（默认 60）+ 解析单测 | O5 |
+| `src/main.rs` | 把新配置项传入 `SplitterConfig`/`ReassemblerConfig` | O5 |
+| `tests/e2e.rs` | 8 处 config 构造补新字段 | 编译 |
+| `config.example.toml` / `config.reassembler.example.toml` / `README.md` | 新配置项文档 | O5 |
+| `Cargo.toml` | 版本 1.10.10 → 1.10.11 | 发布 |
+
+### 行为变化
+
+- **B47 修复**: `send_async` 的等待注册窗口不再漏掉并发重连——隧道恢复后帧立即续传，不会拖满 30s 超时后重置连接（B45 注释中"无竞态窗口"的论断与 tokio 实际语义不符，本轮以源码核对修正）
+- **B48 修复**: RST/心跳清扫后 egress 写任务立即停止（含停滞中的写），不再向已被放弃的目标排空最多 512 块陈旧数据，任务与 socket 即刻回收；`finish_if_done` 的死信号移除后，半关闭排空不再被 cancel 抢先截断
+- **B49 修复**: UDP 域名目标的 DNS 解析 5s 封顶，解析器故障不再阻塞同隧道全部帧处理
+- **O5**: `data_send_timeout_secs`（默认 30s）与 `heartbeat_secs`（默认 60s）对 splitter/reassembler 均可配
+- **O6**: `queue_depth` 指标只计活链路，隧道抖动期不再虚高
+- **O7**: UDP 关联不再分配死 egress 通道（类型层面表达不变式）
+
+### 测试结果
+
+- `cargo test`: 48/48 单元测试 + 4/4 e2e 集成测试通过（新增 7 个：`send_async_sees_link_added_during_first_poll`、`write_to_egress_aborts_on_cancel`、`write_to_egress_stops_immediately_when_pre_cancelled`、`udp_pair_send_to_ip_literal`、`queue_depth_ignores_dead_links`、`udp_syn_creates_no_egress_channel`、`timeout_fields_default_and_parse`）
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 15: 第四轮 Bug 审查修复（v1.10.10）
 
 > **基线**: v1.10.9

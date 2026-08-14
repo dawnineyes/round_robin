@@ -73,6 +73,9 @@ impl TunnelPool {
     pub fn add(&self, link: Arc<TunnelLink>) {
         self.links.lock().unwrap().push(link);
         // Wake every send_async waiter blocked on "no live link".
+        // B47: notify_waiters stores no permit when no waiter is
+        // registered — send_async creates its Notified future BEFORE the
+        // pick, which tokio guarantees will observe this call.
         self.added.notify_waiters();
     }
 
@@ -111,12 +114,16 @@ impl TunnelPool {
         (alive, total)
     }
 
-    /// Sum of queued-but-unwritten frames across all links — a backlog
-    /// proxy for monitoring (heartbeat).
+    /// Sum of queued-but-unwritten frames across all live links — a
+    /// backlog proxy for monitoring (heartbeat).  O6: dead links are
+    /// excluded — their drain task is gone and the closed channel reads
+    /// as `capacity() == 0`, which inflated the metric by the full
+    /// channel depth per dead link between death and the next compact.
     pub fn queue_depth(&self) -> usize {
         let links = self.links.lock().unwrap();
         links
             .iter()
+            .filter(|l| l.alive.load(Ordering::Acquire))
             .map(|l| TUNNEL_CHANNEL_CAP - l.tx.capacity())
             .sum()
     }
@@ -162,6 +169,13 @@ impl TunnelPool {
     pub async fn send_async(&self, frame: Frame) -> bool {
         let mut full: Vec<Arc<TunnelLink>> = Vec::new();
         loop {
+            // B47: create the Notified future BEFORE the pick.  tokio's
+            // `notify_waiters` guarantees a wakeup for every `notified()`
+            // future created before the call — but a `notify_waiters`
+            // landing between the pick and the future creation would be
+            // missed (the B45 comment was wrong: notify_waiters stores no
+            // permit).  Creating it first makes the wait race-free.
+            let added = self.added.notified();
             match self.weighted_pick(&full) {
                 Some(link) => match link.tx.try_send(frame.clone()) {
                     Ok(()) => return true,
@@ -204,8 +218,10 @@ impl TunnelPool {
                             // failing instantly, which truncated every
                             // active connection's transfer on a short total
                             // outage.  Callers wrap this in DATA_SEND_TIMEOUT
-                            // (30s), so the wait stays bounded.
-                            self.added.notified().await;
+                            // (30s), so the wait stays bounded.  The future
+                            // was created before the pick (B47), so a
+                            // concurrent add() can never be missed.
+                            added.await;
                         }
                     }
                 }
@@ -365,6 +381,30 @@ mod tests {
         assert!(!ok);
     }
 
+    /// O6: queue_depth must ignore dead links — a dead link's closed
+    /// channel reads as full depth and used to inflate the backlog
+    /// metric (and the heartbeat log) until the next compact.
+    #[test]
+    fn queue_depth_ignores_dead_links() {
+        let pool = TunnelPool::new();
+        // Production-capacity channels: the metric subtracts from
+        // TUNNEL_CHANNEL_CAP, so smaller test channels would skew it.
+        let (tx1, rx1) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let (tx2, rx2) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let live = mk_link(tx1, 0.0);
+        let dead = mk_link(tx2, 0.0);
+        pool.add(live.clone());
+        pool.add(dead.clone());
+        // One queued frame on the live link.
+        live.tx.try_send(Frame::rst(1)).unwrap();
+        // Dead link with the receiver dropped (closed channel).
+        dead.alive.store(false, Ordering::Release);
+        drop(rx2);
+        assert_eq!(pool.queue_depth(), 1, "only live links count");
+        drop(live);
+        drop(rx1);
+    }
+
     #[tokio::test]
     async fn alive_count_ignores_dead_links() {
         let pool = TunnelPool::new();
@@ -438,9 +478,32 @@ mod tests {
         assert!(!task.is_finished(), "send must wait while no link is live");
         // A reconnect lands — the send must complete promptly.
         pool.add(link);
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), task)
             .await
             .expect("send did not complete after a link was added")
+            .unwrap();
+        assert!(sent);
+        assert_eq!(rx.recv().await.unwrap().conn_id, 7);
+    }
+
+    /// B47 regression: the reconnect add may land anywhere relative to
+    /// send_async's first poll (spawn → pick → wait).  The Notified
+    /// future is created BEFORE the pick, so every interleaving must
+    /// end with the frame sent — never a lost wakeup stalling the send
+    /// until the caller's 30s timeout.
+    #[tokio::test]
+    async fn send_async_sees_link_added_during_first_poll() {
+        let pool = Arc::new(TunnelPool::new());
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+        let link = mk_link(tx, 0.0);
+        let pool2 = pool.clone();
+        let task = tokio::spawn(async move { pool2.send_async(Frame::rst(7)).await });
+        // No sleep: add immediately so the link may land before the
+        // pick, between the pick and the wait, or during the wait.
+        pool.add(link);
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("send did not complete despite the link being added")
             .unwrap();
         assert!(sent);
         assert_eq!(rx.recv().await.unwrap().conn_id, 7);
