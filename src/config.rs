@@ -3,6 +3,8 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use crate::frame;
+
 // ── TOML config schema ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -69,6 +71,61 @@ fn default_heartbeat() -> u64 {
 
 fn default_listen_ip() -> std::net::IpAddr {
     "127.0.0.1".parse().unwrap()
+}
+
+// ── Runtime validation ─────────────────────────────────────────────────
+
+/// B55: validate a duration in seconds — serde cannot express the
+/// invariants.  0 is a foot-gun in both directions: a 0-interval
+/// heartbeat makes the sweep task spin (sleep(0) + a full map sweep per
+/// iteration, 100% CPU), and a 0 send timeout makes every DATA/FIN send
+/// time out instantly (all connections reset in a cascade).
+fn validate_secs(name: &str, secs: u64) -> Result<()> {
+    if secs == 0 {
+        bail!("{name} must be >= 1 second, got 0");
+    }
+    Ok(())
+}
+
+impl SplitterConfig {
+    /// B55: runtime invariants that serde defaults alone don't guard.
+    /// chunk_size is bounded by the wire format (u16 length) and the
+    /// decoder buffer — oversized chunks would make every tunnel die on
+    /// its first encode (BUG-12 semantics).
+    pub fn validate(&self) -> Result<()> {
+        if self.chunk_size < frame::MIN_CHUNK || self.chunk_size > frame::MAX_CHUNK {
+            bail!(
+                "splitter.chunk_size must be {}..{}",
+                frame::MIN_CHUNK,
+                frame::MAX_CHUNK
+            );
+        }
+        validate_secs(
+            "splitter.data_send_timeout_secs",
+            self.data_send_timeout_secs,
+        )?;
+        validate_secs("splitter.heartbeat_secs", self.heartbeat_secs)?;
+        Ok(())
+    }
+}
+
+impl ReassemblerConfig {
+    /// B55: see SplitterConfig::validate.
+    pub fn validate(&self) -> Result<()> {
+        if self.chunk_size < frame::MIN_CHUNK || self.chunk_size > frame::MAX_CHUNK {
+            bail!(
+                "reassembler.chunk_size must be {}..{}",
+                frame::MIN_CHUNK,
+                frame::MAX_CHUNK
+            );
+        }
+        validate_secs(
+            "reassembler.data_send_timeout_secs",
+            self.data_send_timeout_secs,
+        )?;
+        validate_secs("reassembler.heartbeat_secs", self.heartbeat_secs)?;
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -154,6 +211,12 @@ pub fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
             }
         }
     };
+    // B53: the sanity cap applies to explicit lists too — a generated
+    // list of thousands of ports would spawn that many listener tasks
+    // (and bind failures) at startup.  Range and List share one limit.
+    if out.len() > MAX_PORTS {
+        bail!("port list has {} entries, max {MAX_PORTS}", out.len());
+    }
     // BUG-14: duplicate ports make the second listener fail its bind and
     // silently die — dedup and warn instead of half-working configs.
     let mut seen = std::collections::HashSet::new();
@@ -215,6 +278,56 @@ mod tests {
     fn parse_ports_rejects_huge_range() {
         let ports = Ports::Range("1-65535".into());
         assert!(parse_ports(&ports).is_err());
+    }
+
+    /// B53: explicit lists share the Range sanity cap — a generated list
+    /// of thousands of ports must not spawn that many listeners at
+    /// startup.
+    #[test]
+    fn parse_ports_rejects_huge_list() {
+        let ports = Ports::List((1..=257).map(|p| p as u16).collect());
+        assert!(parse_ports(&ports).is_err());
+    }
+
+    /// B55: zero timeouts must be rejected at startup — a 0 heartbeat
+    /// interval spins the sweep task at 100% CPU, a 0 send timeout makes
+    /// every DATA/FIN send time out instantly (connection cascade).
+    #[test]
+    fn validate_rejects_zero_timeouts() {
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+heartbeat_secs = 0
+tunnel = []
+"#,
+        )
+        .unwrap();
+        assert!(cfg.splitter.unwrap().validate().is_err());
+
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "reassembler"
+
+[reassembler]
+data_send_timeout_secs = 0
+"#,
+        )
+        .unwrap();
+        assert!(cfg.reassembler.unwrap().validate().is_err());
+
+        // Positive control: defaults validate.
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+tunnel = []
+"#,
+        )
+        .unwrap();
+        cfg.splitter.unwrap().validate().unwrap();
     }
 
     /// O5: the new timeout fields default and parse from TOML.

@@ -33,6 +33,12 @@ pub struct TunnelLink {
     /// Fires when the link dies: the drain task stops writing, drains the
     /// queue and reports frames that were never written (D1 fast recovery).
     pub stop: Arc<Notify>,
+    /// B56: fires when the drain task exits for any reason.  The tunnel
+    /// read loop selects on it: a silently dead peer (network partition,
+    /// no FIN/RST) would otherwise leave the read blocked until the TCP
+    /// stack's RTO gives up (minutes), delaying the reconnect — the
+    /// drain's own write-stall timeout (60s) now bounds it.
+    pub writer_died: Arc<Notify>,
     /// Frames that were queued but never written when the link died.
     pub lost_frames: Mutex<Vec<Frame>>,
     /// EWMA of drain throughput in bytes/sec (f64 bits).  Written only by
@@ -360,6 +366,11 @@ where
     while let Ok(frame) = rx.try_recv() {
         link.lost_frames.lock().unwrap().push(frame);
     }
+    // B56: the write side has ended for good — release the read loop so
+    // a silently dead peer can't pin it (and the reconnect) for the TCP
+    // RTO duration.  notify_one stores a permit when the reader is not
+    // registered yet, so no exit path can be missed.
+    link.writer_died.notify_one();
     let _ = wr.shutdown().await;
 }
 
@@ -419,6 +430,7 @@ mod tests {
                 frames_sent: AtomicU64::new(0),
                 frames_recv: AtomicU64::new(0),
                 stop: Arc::new(Notify::new()),
+                writer_died: Arc::new(Notify::new()),
                 lost_frames: Mutex::new(Vec::new()),
                 rate_bps: AtomicU64::new(0),
             })
@@ -445,6 +457,7 @@ mod tests {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -528,6 +541,7 @@ mod tests {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -561,6 +575,7 @@ mod tests {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -586,6 +601,7 @@ mod tests {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -607,6 +623,7 @@ mod tests {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(rate.to_bits()),
         })

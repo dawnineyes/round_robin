@@ -6,6 +6,44 @@
 
 ---
 
+## Phase 17: 第六轮 Bug 审查修复 + 优化（v1.10.12）
+
+> **基线**: v1.10.11
+> **来源**: `BUG_REVIEW_v11012.md`（B50–B56）+ `OPTIMIZATION_PLAN_v11012.md`（O8/O9）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/reassembler.rs` | `VirtConnDe` 的 cancel 拆分为 `cancel`（读任务/UDP 响应读任务）与 `cancel_writer`（写任务）双 Notify；新增 `signal_teardown` helper，7 处拆除点（心跳清扫/RST/溢出/egress 写失败/B42/两处 pending-cancelled drain）统一唤醒两个任务；`write_to_egress` 的 half_close 排空臂逐块写与 cancel 竞争（biased）；`read_from_egress` 的 DATA/FIN 发送与 cancel 竞争；`tunnel_read_loop` 监听 `writer_died`；新增 5 个单测 | B50/B51/B52/B56/O8 |
+| `src/splitter.rs` | `tunnel_read_loop` 监听 `link.writer_died`（写侧 60s 超时即读侧退出上界，静默对端不再把重连延迟到 TCP RTO）；新增 1 个单测 | B56 |
+| `src/tunnel.rs` | `TunnelLink` 增加 `writer_died: Notify`，`drain_frames` 任一退出路径触发（写侧停滞超时=隧道死亡探针）；测试构造点同步 | B56 |
+| `src/reorder.rs` | `push` 改 Entry API：窗口内重复帧按普通重复丢弃，不再覆盖旧条目泄漏 `pending_bytes` 字节预算；新增 1 个单测 | B54 |
+| `src/config.rs` | `parse_ports` 的 `MAX_PORTS` 上限扩展到 `Ports::List`（与 Range 一致）；新增 `SplitterConfig::validate()`/`ReassemblerConfig::validate()`（chunk_size + 零值超时校验）；新增 2 个单测 | B53/B55/O9 |
+| `src/main.rs` | 两处内联 chunk_size 校验替换为 `validate()` 调用 | B55/O9 |
+| `Cargo.toml` | 版本 1.10.11 → 1.10.12 | 发布 |
+
+### 行为变化
+
+- **B50 修复**: egress 读/写任务不再共享一个 cancel Notify——每次拆除两个任务同时回收（此前 `notify_one` 只唤醒一个等待者，另一半概率下读任务在对端 EOF 上无限期挂起、或写任务排空最多 32MB 陈旧数据）
+- **B51 修复**: half_close 排空窗口内的 RST/清扫即时停写（B48 修复的最后一个盲臂）
+- **B52 修复**: 拆除后 egress 读任务不再坐满最长 30s 的发送等待，也不会在隧道恢复后发出一帧死 cid 的陈旧数据
+- **B53 修复**: 超长端口列表与超长 Range 同等待遇——启动即报错而非 spawn 数千监听任务
+- **B54 修复**: 重排窗口字节预算在重复帧下不再漂移（防御纵深；正常对端恰好一次投递）
+- **B55 修复**: `heartbeat_secs = 0`/`data_send_timeout_secs = 0` 启动即报错（此前分别导致心跳忙等烧核 / 全部连接批量重置）
+- **B56 修复**: 隧道读循环退出上界从 TCP RTO（分钟级）收敛到写侧 60s 超时——静默分区后隧道槽位恢复时间确定化、读任务不泄漏至 RTO
+- **O8**: 拆除路径收敛为 `signal_teardown` 单一 helper，双任务唤醒不变式单点保证
+- **O9**: 配置校验集中在 `validate()`（E4 部分落地），可单测
+
+### 测试结果
+
+- `cargo test`: 55/55 单元测试 + 4/4 e2e 集成测试通过（新增 7 个：`teardown_wakes_both_egress_tasks`、`write_to_egress_cancel_during_half_close_drain`、`tunnel_read_loop_exits_when_writer_dies`（splitter + reassembler 各一）、`duplicate_of_pending_frame_does_not_leak_bytes`、`parse_ports_rejects_huge_list`、`validate_rejects_zero_timeouts`）
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 16: 第五轮 Bug 审查修复 + 优化（v1.10.11）
 
 > **基线**: v1.10.10

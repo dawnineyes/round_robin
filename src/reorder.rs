@@ -66,23 +66,39 @@ impl ReorderBuf {
                 accepted: true,
                 overflow: false,
             }
-        } else if self.pending.len() < MAX_REORDER_WINDOW
-            && self.pending_bytes + payload.len() <= MAX_REORDER_BYTES
-        {
-            self.pending_bytes += payload.len();
-            self.pending.insert(seq, payload);
-            PushResult {
-                ready,
-                accepted: true,
-                overflow: false,
-            }
         } else {
-            // Buffer full — drop the frame. The caller must reset the
-            // connection: the missing seq will never be retransmitted.
-            PushResult {
-                ready,
-                accepted: false,
-                overflow: true,
+            // B54: check the capacity before `entry` (which borrows the
+            // map mutably) and dedup pending duplicates via the entry
+            // API.  The old `insert` replaced a buffered entry and added
+            // the new payload's bytes without subtracting the old ones —
+            // every duplicate leaked byte budget and could trip the
+            // overflow reset early.
+            let can_buffer = self.pending.len() < MAX_REORDER_WINDOW
+                && self.pending_bytes + payload.len() <= MAX_REORDER_BYTES;
+            match self.pending.entry(seq) {
+                std::collections::btree_map::Entry::Vacant(e) if can_buffer => {
+                    self.pending_bytes += payload.len();
+                    e.insert(payload);
+                    PushResult {
+                        ready,
+                        accepted: true,
+                        overflow: false,
+                    }
+                }
+                // Buffer full — drop the frame. The caller must reset the
+                // connection: the missing seq will never be retransmitted.
+                std::collections::btree_map::Entry::Vacant(_) => PushResult {
+                    ready,
+                    accepted: false,
+                    overflow: true,
+                },
+                // Duplicate of a frame still buffered in the window —
+                // drop it like any other duplicate.
+                std::collections::btree_map::Entry::Occupied(_) => PushResult {
+                    ready,
+                    accepted: false,
+                    overflow: false,
+                },
             }
         }
     }
@@ -160,6 +176,26 @@ mod tests {
         let ready = buf.push(1, Bytes::from_static(b"z"));
         assert!(ready.accepted);
         assert_eq!(ready.ready.len(), accepted + 1);
+        assert_eq!(buf.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn duplicate_of_pending_frame_does_not_leak_bytes() {
+        // B54: a duplicate of a still-buffered frame used to replace the
+        // pending entry and add the new payload's bytes again — the byte
+        // accounting leaked on every duplicate and could trip the
+        // overflow reset early.  A dup must be dropped like any other.
+        let mut buf = ReorderBuf::new();
+        assert!(buf.push(2, Bytes::from(vec![0u8; 10])).accepted);
+        assert_eq!(buf.pending_bytes(), 10);
+        // Same seq, different payload — duplicate, not a replacement.
+        let dup = buf.push(2, Bytes::from(vec![0u8; 1000]));
+        assert!(!dup.accepted && !dup.overflow);
+        assert_eq!(buf.pending_bytes(), 10, "duplicate must not leak bytes");
+        // The original payload must still be delivered untouched.
+        let ready = buf.push(1, Bytes::from_static(b"z"));
+        assert_eq!(ready.ready.len(), 2);
+        assert_eq!(ready.ready[1].len(), 10);
         assert_eq!(buf.pending_bytes(), 0);
     }
 }

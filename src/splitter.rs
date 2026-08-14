@@ -200,6 +200,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                             frames_sent: AtomicU64::new(0),
                             frames_recv: AtomicU64::new(0),
                             stop: Arc::new(tokio::sync::Notify::new()),
+                            writer_died: Arc::new(tokio::sync::Notify::new()),
                             lost_frames: Mutex::new(Vec::new()),
                             rate_bps: AtomicU64::new(0),
                         });
@@ -504,7 +505,15 @@ async fn tunnel_read_loop(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
-        let frame = match decoder.try_next(&mut rd).await? {
+        // B56: the drain task's write-stall timeout (60s) is the
+        // tunnel's liveness probe.  When the writer side dies, the peer
+        // may be silently gone (no FIN/RST) — exit now instead of
+        // blocking in read until the TCP stack's RTO gives up (minutes),
+        // which would delay this tunnel's reconnect.
+        let frame = match tokio::select! {
+            r = decoder.try_next(&mut rd) => r?,
+            _ = link.writer_died.notified() => return Ok(()),
+        } {
             Some(f) => f,
             None => return Ok(()),
         };
@@ -1119,5 +1128,54 @@ mod tests {
         assert!(fin_sweep_decision(false, 31, false));
         // Orphaned but recently active → keep (complete path needs 30s too).
         assert!(!fin_sweep_decision(true, 10, false));
+    }
+
+    /// B56 regression: a silently dead peer (no FIN/RST) must not pin
+    /// the tunnel read loop — the drain task's writer_died signal bounds
+    /// the exit instead of waiting out the TCP RTO (minutes), which
+    /// would delay this tunnel's reconnect.
+    #[tokio::test]
+    async fn tunnel_read_loop_exits_when_writer_dies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (rd, _wr) = server.into_split();
+
+        let conns: ConnMap = Arc::new(DashMap::new());
+        let pool = Arc::new(TunnelPool::new());
+        let (tx, _rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let link = Arc::new(TunnelLink {
+            tx,
+            alive: AtomicBool::new(true),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            writer_died: Arc::new(tokio::sync::Notify::new()),
+            lost_frames: Mutex::new(Vec::new()),
+            rate_bps: AtomicU64::new(0),
+        });
+        let time_wait = Arc::new(DashMap::new());
+        let resets = Arc::new(AtomicU64::new(0));
+        let link2 = link.clone();
+        let task = tokio::spawn(async move {
+            tunnel_read_loop(rd, &conns, &pool, &link2, &time_wait, &resets).await
+        });
+        // The read must be blocked on the silent peer...
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "read loop must be blocked on the silent peer"
+        );
+        // ...until the writer side dies.
+        link.writer_died.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("read loop did not exit after writer death")
+            .unwrap()
+            .unwrap();
+        drop(peer);
     }
 }

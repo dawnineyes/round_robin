@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use round_robin::config::{find_config, parse_ports};
-use round_robin::{frame, logging, reassembler, splitter};
+use round_robin::{logging, reassembler, splitter};
 use std::path::PathBuf;
 
 // ── Main ──────────────────────────────────────────────────────────────
@@ -63,13 +63,9 @@ async fn main() -> Result<()> {
             let sc = cfg
                 .splitter
                 .ok_or_else(|| anyhow::anyhow!("config missing [splitter] section"))?;
-            if sc.chunk_size < frame::MIN_CHUNK || sc.chunk_size > frame::MAX_CHUNK {
-                bail!(
-                    "splitter.chunk_size must be {}..{}",
-                    frame::MIN_CHUNK,
-                    frame::MAX_CHUNK
-                );
-            }
+            // B55: chunk_size + timeout invariants (0-interval heartbeat
+            // would spin the sweep task; 0 send timeout resets every conn).
+            sc.validate()?;
             let tunnels: Vec<splitter::TunnelEndpoint> = sc
                 .tunnel
                 .iter()
@@ -96,13 +92,8 @@ async fn main() -> Result<()> {
             let rc = cfg
                 .reassembler
                 .ok_or_else(|| anyhow::anyhow!("config missing [reassembler] section"))?;
-            if rc.chunk_size < frame::MIN_CHUNK || rc.chunk_size > frame::MAX_CHUNK {
-                bail!(
-                    "reassembler.chunk_size must be {}..{}",
-                    frame::MIN_CHUNK,
-                    frame::MAX_CHUNK
-                );
-            }
+            // B55: see the splitter branch.
+            rc.validate()?;
             let ports = parse_ports(&rc.ports)?;
             reassembler::run_reassembler(reassembler::ReassemblerConfig {
                 listen_ip: rc.listen,

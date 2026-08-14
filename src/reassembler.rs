@@ -77,6 +77,18 @@ impl VirtConnDe {
     }
 }
 
+/// B50: every teardown path (RST / idle sweep / overflow / egress write
+/// failure / egress send failure) must wake BOTH egress tasks.  Each
+/// Notify has exactly one waiter, so `notify_one` stores a permit if the
+/// task has not registered yet — no lost-wakeup window (unlike a shared
+/// Notify, where the second waiter would miss the single wakeup).
+/// UDP conns have no egress writer; the stored permit is dropped with
+/// the Arc, which is harmless.
+fn signal_teardown(vc: &VirtConnDe) {
+    vc.cancel.notify_one();
+    vc.cancel_writer.notify_one();
+}
+
 // ── Virtual connection (reassembler side) ─────────────────────────────
 
 struct VirtConnDe {
@@ -85,8 +97,17 @@ struct VirtConnDe {
     /// whose receiver was dropped immediately, a dead allocation).
     egress: Option<EgressConn>,
     reorder: Mutex<ReorderBuf>,
-    /// Teardown signal (RST / idle sweep / duplicate).
+    /// Teardown signal for the egress reader / UDP response reader
+    /// (RST / idle sweep / overflow).
     cancel: Arc<Notify>,
+    /// B50: teardown signal for the egress writer.  Reader and writer
+    /// used to share one Notify, but `notify_one` wakes only a single
+    /// waiter — the loser of the race relied on the peer closing the
+    /// connection (indefinite task+fd leak on a stalled target) or
+    /// drained up to 32 MB of stale chunks to the abandoned target
+    /// (B48 regression).  One Notify per task keeps `notify_one`'s
+    /// stored-permit semantics race-free (single waiter each).
+    cancel_writer: Arc<Notify>,
     /// Half-close signal: shut the egress write half down.
     half_close: Arc<Notify>,
     /// FIN received from the splitter (half-close in progress).
@@ -240,7 +261,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                 if idle > timeout {
                     warn!(conn_id = cid, idle_secs = idle, "connection idle timeout");
                     hb_closed.insert(cid, Instant::now());
-                    vc.cancel.notify_one();
+                    signal_teardown(vc);
                     return false;
                 }
                 true
@@ -427,6 +448,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -507,7 +529,14 @@ struct ReadLoopCtx {
 async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopCtx) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
-        let frame = match decoder.try_next(&mut rd).await? {
+        // B56: exit when the drain task died on its own (write stall =
+        // tunnel dead).  A silently dead peer would otherwise keep this
+        // task (and its socket half) blocked in read until the TCP
+        // stack's RTO gives up — minutes instead of the 60s bound.
+        let frame = match tokio::select! {
+            r = decoder.try_next(&mut rd) => r?,
+            _ = ctx.link.writer_died.notified() => return Ok(()),
+        } {
             Some(f) => f,
             None => return Ok(()),
         };
@@ -630,6 +659,9 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         // to the same target can't cross their datagrams).
         if syn_target.proto == PROTO_UDP {
             let cancel = Arc::new(Notify::new());
+            // B50: separate per-task teardown Notify (no waiter here —
+            // UDP conns have no egress writer; see signal_teardown).
+            let cancel_writer = Arc::new(Notify::new());
             let half_close = Arc::new(Notify::new());
             // B38: a UDP socket bind failure must not propagate out of
             // handle_frame — the `?` used to kill the entire tunnel read
@@ -654,6 +686,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 egress: None, // O7: UDP datagrams bypass the egress channel
                 reorder: Mutex::new(ReorderBuf::new()),
                 cancel: cancel.clone(),
+                cancel_writer: cancel_writer.clone(),
                 half_close: half_close.clone(),
                 fin_received: AtomicBool::new(false),
                 fin_seq: AtomicU64::new(0),
@@ -754,7 +787,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             if let Some(entry) = remove_pending(ctx, &cid) {
                 if entry.cancelled {
                     if let Some((_, vc)) = ctx.conns.remove(&cid) {
-                        vc.cancel.notify_one();
+                        signal_teardown(&vc);
                         drop(vc);
                     }
                     ctx.closed.insert(cid, Instant::now());
@@ -830,12 +863,18 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         let (egress_rd, egress_wr) = egress_stream.into_split();
         let (write_tx, write_rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
         let cancel = Arc::new(Notify::new());
+        // B50: the writer gets its own teardown Notify — reader and
+        // writer sharing one Notify meant every teardown woke only one
+        // of them (notify_one wakes a single waiter); the loser leaked
+        // until the target closed or drained stale data.
+        let cancel_writer = Arc::new(Notify::new());
         let half_close = Arc::new(Notify::new());
 
         let vconn = Arc::new(VirtConnDe {
             egress: Some(EgressConn { write_tx }),
             reorder: Mutex::new(ReorderBuf::new()),
             cancel: cancel.clone(),
+            cancel_writer: cancel_writer.clone(),
             half_close: half_close.clone(),
             fin_received: AtomicBool::new(false),
             fin_seq: AtomicU64::new(0),
@@ -860,7 +899,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             write_rx,
             egress_wr,
             half_close,
-            cancel.clone(),
+            cancel_writer,
         ));
 
         // Spawn egress reader: egress response → frames → pool
@@ -884,7 +923,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             if entry.cancelled {
                 // BUG-4: RST raced the connect — tear the fresh conn down.
                 if let Some((_, vc)) = ctx.conns.remove(&cid) {
-                    vc.cancel.notify_one();
+                    signal_teardown(&vc);
                     drop(vc);
                 }
                 ctx.closed.insert(cid, Instant::now());
@@ -971,7 +1010,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                         drop(vconn);
                         ctx.closed.insert(cid, Instant::now());
                         if let Some((_, vconn)) = ctx.conns.remove(&cid) {
-                            vconn.cancel.notify_one();
+                            signal_teardown(&vconn);
                             drop(vconn);
                         }
                         ctx.pool.send(Frame::rst(cid));
@@ -986,7 +1025,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                         drop(vconn);
                         ctx.closed.insert(cid, Instant::now());
                         if let Some((_, vconn)) = ctx.conns.remove(&cid) {
-                            vconn.cancel.notify_one();
+                            signal_teardown(&vconn);
                             drop(vconn);
                         }
                         ctx.pool.send(Frame::rst(cid));
@@ -1130,7 +1169,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
     if frame.flags & FLAG_RST != 0 {
         if let Some((_, vconn)) = ctx.conns.remove(&cid) {
             ctx.closed.insert(cid, Instant::now());
-            vconn.cancel.notify_one();
+            signal_teardown(&vconn);
             info!(conn_id = cid, "RST, force close");
             drop(vconn);
             ctx.resets.fetch_add(1, Ordering::Relaxed);
@@ -1360,7 +1399,7 @@ async fn write_to_egress<W>(
     mut rx: mpsc::Receiver<Bytes>,
     mut wr: W,
     half_close: Arc<Notify>,
-    cancel: Arc<Notify>,
+    cancel_writer: Arc<Notify>,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -1372,7 +1411,7 @@ async fn write_to_egress<W>(
         // only exits when the channel closes after the queue drains.
         tokio::select! {
             biased;
-            _ = cancel.notified() => break,
+            _ = cancel_writer.notified() => break,
             chunk = rx.recv() => {
                 let Some(chunk) = chunk else { break }; // vconn dropped — teardown
                 // B48: race the write itself against cancel too — a
@@ -1380,7 +1419,7 @@ async fn write_to_egress<W>(
                 // connection that was reset mid-write.
                 tokio::select! {
                     biased;
-                    _ = cancel.notified() => break,
+                    _ = cancel_writer.notified() => break,
                     r = tokio::time::timeout(EGRESS_WRITE_TIMEOUT, wr.write_all(&chunk)) => {
                         match r {
                             Ok(Ok(())) => {}
@@ -1393,10 +1432,19 @@ async fn write_to_egress<W>(
                 // Peer FIN and all in-flight data delivered: drain whatever
                 // is still queued, then half-close so the server sees EOF
                 // and can finish its response.
+                // B51: the drain races cancel like every other write — a
+                // reset mid-drain must stop the stale data immediately,
+                // not after up to 512 queued chunks.
                 while let Ok(chunk) = rx.try_recv() {
-                    match tokio::time::timeout(EGRESS_WRITE_TIMEOUT, wr.write_all(&chunk)).await {
-                        Ok(Ok(())) => {}
-                        _ => break,
+                    tokio::select! {
+                        biased;
+                        _ = cancel_writer.notified() => return,
+                        r = tokio::time::timeout(EGRESS_WRITE_TIMEOUT, wr.write_all(&chunk)) => {
+                            match r {
+                                Ok(Ok(())) => {}
+                                _ => break,
+                            }
+                        }
                     }
                 }
                 let _ = wr.shutdown().await;
@@ -1449,16 +1497,29 @@ async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressRea
                         // Real backpressure: wait for a tunnel to take the
                         // frame (bounded by data_send_timeout; B45 makes the
                         // wait cover short tunnel-reconnect gaps).
-                        let sent = tokio::time::timeout(data_send_timeout, pool.send_async(frame))
-                            .await
-                            .unwrap_or(false);
+                        // B52: race the wait against cancel — a teardown
+                        // must not sit out up to 30s waiting for tunnel
+                        // capacity (and then ship a stale frame once the
+                        // tunnels recover).
+                        let sent = tokio::select! {
+                            biased;
+                            _ = cancel.notified() => {
+                                cancelled = true;
+                                false
+                            }
+                            r = tokio::time::timeout(data_send_timeout, pool.send_async(frame)) => {
+                                r.unwrap_or(false)
+                            }
+                        };
                         if !sent {
-                            warn!(conn_id, "no live tunnels for egress response after timeout");
-                            // B42: the response seq stream is permanently
-                            // broken (TCP tunnels never retransmit) — the
-                            // normal FIN flow would hand the splitter a
-                            // gap it can never fill.  Fail fast instead.
-                            send_failed = true;
+                            if !cancelled {
+                                warn!(conn_id, "no live tunnels for egress response after timeout");
+                                // B42: the response seq stream is permanently
+                                // broken (TCP tunnels never retransmit) — the
+                                // normal FIN flow would hand the splitter a
+                                // gap it can never fill.  Fail fast instead.
+                                send_failed = true;
+                            }
                             break;
                         }
                         // Count on the VirtConnDe — the task already holds
@@ -1488,7 +1549,7 @@ async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressRea
         warn!(conn_id, "egress response send failed, resetting connection");
         closed.insert(conn_id, Instant::now());
         if let Some((_, vc)) = conns.remove(&conn_id) {
-            vc.cancel.notify_one();
+            signal_teardown(&vc);
         }
         pool.send(Frame::rst(conn_id));
         return;
@@ -1497,10 +1558,16 @@ async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressRea
     // the splitter may still be sending data on the other direction.
     // The conn is removed only once the splitter's FIN half-closes
     // the egress write side as well (finish_if_done).
-    let fin_sent =
-        tokio::time::timeout(data_send_timeout, pool.send_async(Frame::fin(conn_id, seq)))
-            .await
-            .unwrap_or(false);
+    // B52: race the FIN send against cancel like the DATA sends — a
+    // teardown mid-wait stops immediately instead of sitting out the
+    // timeout (and the RST fallback is pointless for a dead conn).
+    let fin_sent = tokio::select! {
+        biased;
+        _ = cancel.notified() => false,
+        r = tokio::time::timeout(data_send_timeout, pool.send_async(Frame::fin(conn_id, seq))) => {
+            r.unwrap_or(false)
+        }
+    };
     if !fin_sent {
         // B42: without a FIN the splitter's client hangs until its 60s
         // quiet timeout — best-effort RST so it fails fast as soon as
@@ -1671,6 +1738,7 @@ mod tests {
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
+            writer_died: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -1701,6 +1769,7 @@ mod tests {
             egress: Some(EgressConn { write_tx }),
             reorder: Mutex::new(ReorderBuf::new()),
             cancel: Arc::new(Notify::new()),
+            cancel_writer: Arc::new(Notify::new()),
             half_close: Arc::new(Notify::new()),
             fin_received: AtomicBool::new(false),
             fin_seq: AtomicU64::new(0),
@@ -1965,6 +2034,146 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .expect("pre-cancelled writer did not exit")
+            .unwrap();
+        drop(peer);
+    }
+
+    /// B50 regression: reader and writer each wait on their OWN teardown
+    /// Notify — a shared Notify woke only one of the two waiters per
+    /// `notify_one`, and the loser hung on the peer (deliberately never
+    /// closed here) or drained stale data (the B48 regression).
+    #[tokio::test]
+    async fn teardown_wakes_both_egress_tasks() {
+        let (ctx, _rx) = make_ctx();
+        let cid = 77u32;
+        // Real TCP pair standing in for the egress connection; the peer
+        // half is never closed — a stalled target must not pin either
+        // task after teardown.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (rd, wr) = server.into_split();
+
+        let (write_tx, write_rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
+        let cancel = Arc::new(Notify::new());
+        let cancel_writer = Arc::new(Notify::new());
+        let half_close = Arc::new(Notify::new());
+        let vconn = Arc::new(VirtConnDe {
+            egress: Some(EgressConn { write_tx }),
+            reorder: Mutex::new(ReorderBuf::new()),
+            cancel: cancel.clone(),
+            cancel_writer: cancel_writer.clone(),
+            half_close: half_close.clone(),
+            fin_received: AtomicBool::new(false),
+            fin_seq: AtomicU64::new(0),
+            half_close_state: AtomicU8::new(0),
+            is_udp: false,
+            udp_sock: None,
+            egress_eof: AtomicBool::new(false),
+            created_at: Instant::now(),
+            last_active: Mutex::new(Instant::now()),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
+        });
+
+        let w_task = tokio::spawn(write_to_egress(
+            write_rx,
+            wr,
+            half_close,
+            cancel_writer.clone(),
+        ));
+        let r_task = tokio::spawn(read_from_egress(
+            rd,
+            EgressReaderCtx {
+                conn_id: cid,
+                conns: ctx.conns.clone(),
+                pool: ctx.pool.clone(),
+                chunk_size: 4096,
+                cancel: cancel.clone(),
+                closed: ctx.closed.clone(),
+                vconn: vconn.clone(),
+                data_send_timeout: Duration::from_secs(30),
+            },
+        ));
+
+        // Let both tasks register their waiters, then tear down once.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        signal_teardown(&vconn);
+
+        // Both must exit promptly even though the target never closes.
+        tokio::time::timeout(std::time::Duration::from_secs(2), w_task)
+            .await
+            .expect("egress writer stuck after teardown")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), r_task)
+            .await
+            .expect("egress reader stuck after teardown")
+            .unwrap();
+        drop(peer);
+    }
+
+    /// B51 regression: chunks can still land in the channel after the
+    /// half-close fires (in-flight DATA on other tunnels) — a teardown
+    /// during that drain must stop it immediately, not after the
+    /// remaining chunks or the 60s stall timeout.  Post-fix the cancel
+    /// wins in every arm of the writer; pre-fix the half-close drain
+    /// ignored it entirely.
+    #[tokio::test]
+    async fn write_to_egress_cancel_during_half_close_drain() {
+        // Tiny duplex: every 1 KB chunk write stalls (peer never reads),
+        // holding the writer inside its current arm while we cancel.
+        let (peer, wr) = tokio::io::duplex(4);
+        let (tx, rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
+        let cancel = Arc::new(Notify::new());
+        let half_close = Arc::new(Notify::new());
+        // Half-close fires first — the writer enters the drain.
+        half_close.notify_one();
+        let task = tokio::spawn(write_to_egress(rx, wr, half_close, cancel.clone()));
+        // A concurrent sender keeps the channel fed during the drain
+        // window, so the drain's write path is actually exercised.
+        let feeder = tokio::spawn(async move {
+            for _ in 0..64 {
+                let _ = tx.try_send(Bytes::from(vec![0u8; 1024]));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("half-close drain did not stop after cancel")
+            .unwrap();
+        feeder.abort();
+        drop(peer);
+    }
+
+    /// B56 regression: the read loop must exit when the drain task dies
+    /// (writer_died) — a silently dead peer (no FIN/RST) would otherwise
+    /// keep this task and its socket half blocked in read for the TCP
+    /// RTO duration (minutes).
+    #[tokio::test]
+    async fn tunnel_read_loop_exits_when_writer_dies() {
+        let (ctx, _rx) = make_ctx();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (rd, _wr) = server.into_split();
+
+        let task = tokio::spawn(tunnel_read_loop(rd, ctx.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "read loop must be blocked on the silent peer"
+        );
+        ctx.link.writer_died.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("read loop did not exit after writer death")
+            .unwrap()
             .unwrap();
         drop(peer);
     }
