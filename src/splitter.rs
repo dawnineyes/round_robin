@@ -94,7 +94,11 @@ impl VirtConn {
     /// client channel is full/closed (client can't keep up).
     fn on_frame(&self, seq: u64, payload: Bytes) -> bool {
         let plen = payload.len() as u64;
-        let result = self.reorder.lock().unwrap().push(seq, payload);
+        // Hold the reorder lock across push + channel writes: concurrent
+        // deliveries from other tunnels must not interleave their ready
+        // chunks (mpsc try_send from two tasks has no total order).
+        let mut reorder = self.reorder.lock().unwrap();
+        let result = reorder.push(seq, payload);
         if !result.accepted {
             // Duplicate or window-overflow drop — don't update stats.
             return result.overflow;
@@ -232,6 +236,11 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
         });
     }
 
+    // Bind the SOCKS listener BEFORE waiting for the first tunnel:
+    // clients then get a deterministic failure reply (BUG-10) instead of
+    // ECONNREFUSED while tunnels are still connecting (CI e2e race).
+    let listener = TcpListener::bind(cfg.listen_addr).await?;
+
     // Wait for at least one tunnel. BUG-9: honor shutdown while waiting —
     // a bad proxy config used to make Ctrl+C impossible to exit.
     while pool.link_count() == 0 {
@@ -346,9 +355,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
         }
     });
 
-    // 2. Accept SOCKS5 clients
-    let listener = TcpListener::bind(cfg.listen_addr).await?;
-
+    // 2. Accept SOCKS5 clients (listener already bound above)
     // Max concurrent connections — prevent resource exhaustion.
     const MAX_CONCURRENT_CONNS: usize = 4096;
 

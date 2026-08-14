@@ -789,14 +789,24 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             let mut fin_seq: Option<u64> = None;
             for f in entry.frames {
                 if f.flags & FLAG_DATA != 0 {
-                    let result = vconn.reorder.lock().unwrap().push(f.seq, f.payload);
+                    // Hold the reorder lock across push + egress writes —
+                    // concurrent tunnel deliveries must not interleave
+                    // their ready chunks.
+                    let mut reorder = vconn.reorder.lock().unwrap();
+                    let result = reorder.push(f.seq, f.payload);
                     // Pending frames are replayed — stats already counted when
                     // originally queued, so don't double-count here.
+                    let mut write_failed = false;
                     for chunk in result.ready {
                         if !vconn.egress.write(chunk) {
                             warn!(conn_id = cid, "egress write failed (drain)");
+                            write_failed = true;
                             break;
                         }
+                    }
+                    drop(reorder);
+                    if write_failed {
+                        break;
                     }
                     if vconn.fin_received.load(Ordering::Acquire) {
                         close_write_half(&vconn, cid, false);
@@ -829,39 +839,48 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 return Ok(());
             }
             let plen = frame.payload.len() as u64;
-            let result = vconn.reorder.lock().unwrap().push(frame.seq, frame.payload);
-            if !result.accepted {
-                if result.overflow {
-                    // Window full — the sequence is permanently broken;
-                    // reset both sides instead of stalling forever.
-                    warn!(
-                        conn_id = cid,
-                        seq = frame.seq,
-                        "reorder window overflow, resetting connection"
-                    );
-                    drop(vconn);
-                    ctx.closed.insert(cid, Instant::now());
-                    if let Some((_, vconn)) = ctx.conns.remove(&cid) {
-                        vconn.cancel.notify_one();
+            // Hold the reorder lock across push + egress writes so ready
+            // chunks from concurrent tunnel deliveries can't interleave
+            // (mpsc try_send from two tasks has no total order).
+            {
+                let mut reorder = vconn.reorder.lock().unwrap();
+                let result = reorder.push(frame.seq, frame.payload);
+                if !result.accepted {
+                    let overflow = result.overflow;
+                    drop(reorder);
+                    if overflow {
+                        // Window full — the sequence is permanently broken;
+                        // reset both sides instead of stalling forever.
+                        warn!(
+                            conn_id = cid,
+                            seq = frame.seq,
+                            "reorder window overflow, resetting connection"
+                        );
                         drop(vconn);
+                        ctx.closed.insert(cid, Instant::now());
+                        if let Some((_, vconn)) = ctx.conns.remove(&cid) {
+                            vconn.cancel.notify_one();
+                            drop(vconn);
+                        }
+                        ctx.pool.send(Frame::rst(cid));
+                        ctx.resets.fetch_add(1, Ordering::Relaxed);
                     }
-                    ctx.pool.send(Frame::rst(cid));
-                    ctx.resets.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(());
-            }
-            for chunk in result.ready {
-                if !vconn.egress.write(chunk) {
-                    warn!(conn_id = cid, "egress write failed, resetting connection");
-                    drop(vconn);
-                    ctx.closed.insert(cid, Instant::now());
-                    if let Some((_, vconn)) = ctx.conns.remove(&cid) {
-                        vconn.cancel.notify_one();
-                        drop(vconn);
-                    }
-                    ctx.pool.send(Frame::rst(cid));
-                    ctx.resets.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
+                }
+                for chunk in result.ready {
+                    if !vconn.egress.write(chunk) {
+                        drop(reorder);
+                        warn!(conn_id = cid, "egress write failed, resetting connection");
+                        drop(vconn);
+                        ctx.closed.insert(cid, Instant::now());
+                        if let Some((_, vconn)) = ctx.conns.remove(&cid) {
+                            vconn.cancel.notify_one();
+                            drop(vconn);
+                        }
+                        ctx.pool.send(Frame::rst(cid));
+                        ctx.resets.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
                 }
             }
             vconn.bytes_recv.fetch_add(plen, Ordering::Relaxed);

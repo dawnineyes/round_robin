@@ -134,12 +134,41 @@ async fn run_udp_target(sock: UdpSocket) {
 
 // ── SOCKS5 client helpers ─────────────────────────────────────────────
 
+/// CI-scheduling guard: the splitter binds its SOCKS listener (and
+/// registers its first tunnel) only after its tasks get scheduled — on
+/// busy runners the client can race ahead.  Retry the whole handshake
+/// for up to 10s: both ECONNREFUSED (listener not bound yet) and a
+/// SOCKS failure reply (no live tunnels yet) are retryable.
 async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match socks5_handshake(proxy, host, port).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+async fn socks5_handshake(
+    proxy: SocketAddr,
+    host: &str,
+    port: u16,
+) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(proxy).await?;
     s.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut resp = [0u8; 2];
     s.read_exact(&mut resp).await?;
-    assert_eq!(resp, [0x05, 0x00]);
+    if resp != [0x05, 0x00] {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 auth failed: {:02x} {:02x}",
+            resp[0], resp[1]
+        )));
+    }
     // CONNECT with domain address
     let hb = host.as_bytes();
     let mut req = vec![0x05, 0x01, 0x00, 0x03, hb.len() as u8];
@@ -148,7 +177,12 @@ async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Re
     s.write_all(&req).await?;
     let mut head = [0u8; 4];
     s.read_exact(&mut head).await?;
-    assert_eq!(head[1], 0x00, "SOCKS5 CONNECT failed: rep=0x{:02x}", head[1]);
+    if head[1] != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 CONNECT failed: rep=0x{:02x}",
+            head[1]
+        )));
+    }
     match head[3] {
         0x01 => {
             let mut rest = [0u8; 6];
@@ -164,33 +198,32 @@ async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Re
             let mut rest = vec![0u8; len[0] as usize + 2];
             s.read_exact(&mut rest).await?;
         }
-        other => panic!("bad reply atyp {other}"),
+        other => return Err(std::io::Error::other(format!("bad reply atyp {other}"))),
     }
     Ok(s)
 }
 
-/// UDP ASSOCIATE + send one datagram; returns the response payload.
+/// UDP ASSOCIATE with retry, then send one datagram; returns the
+/// response payload.
 async fn udp_associate_exchange(
     proxy: SocketAddr,
     target: SocketAddr,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut ctrl = TcpStream::connect(proxy).await.unwrap();
-    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut resp = [0u8; 2];
-    ctrl.read_exact(&mut resp).await.unwrap();
-    assert_eq!(resp, [0x05, 0x00]);
-    // UDP ASSOCIATE, addr 0.0.0.0:0
-    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
-        .unwrap();
-    let mut head = [0u8; 4];
-    ctrl.read_exact(&mut head).await.unwrap();
-    assert_eq!(head[1], 0x00);
-    assert_eq!(head[3], 0x01);
-    let mut bind = [0u8; 6];
-    ctrl.read_exact(&mut bind).await.unwrap();
-    let relay = SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([bind[4], bind[5]])));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (ctrl, relay) = loop {
+        match udp_associate(proxy).await {
+            Ok(v) => break v,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("UDP ASSOCIATE failed after retries: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    // Keep the control connection alive until the exchange is done.
+    let _keepalive = ctrl;
 
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     // SOCKS5 UDP datagram header: RSV(2) FRAG(1) ATYP(1) ADDR(4) PORT(2)
@@ -211,6 +244,35 @@ async fn udp_associate_exchange(
         .unwrap();
     // strip SOCKS5 UDP header (4 + 4 + 2 = 10 bytes for IPv4)
     buf[10..n].to_vec()
+}
+
+/// One UDP ASSOCIATE handshake; Err on any failure (retryable).
+async fn udp_associate(proxy: SocketAddr) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let mut ctrl = TcpStream::connect(proxy).await?;
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut resp = [0u8; 2];
+    ctrl.read_exact(&mut resp).await?;
+    if resp != [0x05, 0x00] {
+        return Err(std::io::Error::other("SOCKS5 auth failed"));
+    }
+    // UDP ASSOCIATE, addr 0.0.0.0:0
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    let mut head = [0u8; 4];
+    ctrl.read_exact(&mut head).await?;
+    if head[1] != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "UDP ASSOCIATE failed: rep=0x{:02x}",
+            head[1]
+        )));
+    }
+    if head[3] != 0x01 {
+        return Err(std::io::Error::other("unexpected bind atyp"));
+    }
+    let mut bind = [0u8; 6];
+    ctrl.read_exact(&mut bind).await?;
+    let relay = SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([bind[4], bind[5]])));
+    Ok((ctrl, relay))
 }
 
 // ── killable proxy (D1 test) ──────────────────────────────────────────
