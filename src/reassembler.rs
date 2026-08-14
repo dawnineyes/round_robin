@@ -468,7 +468,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(crate::tunnel::now_millis()),
+            last_active_ms: AtomicU64::new(crate::tunnel::now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -567,9 +567,10 @@ async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopC
         dispatch_frame(frame, &ctx).await?;
         ctx.link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         ctx.link.frames_recv.fetch_add(1, Ordering::Relaxed);
-        // B57: inbound activity stamps the link's liveness clock.
+        // B57/B59: inbound activity stamps the link's liveness clock
+        // (the drain task stamps outbound writes — both directions).
         ctx.link
-            .last_recv_ms
+            .last_active_ms
             .store(crate::tunnel::now_millis(), Ordering::Relaxed);
     }
 }
@@ -1766,7 +1767,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(crate::tunnel::now_millis()),
+            last_active_ms: AtomicU64::new(crate::tunnel::now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });

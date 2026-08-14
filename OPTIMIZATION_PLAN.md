@@ -11,6 +11,7 @@
 > - **v1.10.12（已实施，Phase 17）**：O8 拆除路径统一 ✅（`signal_teardown` 一处 helper 覆盖 7 处 RST/清扫/溢出拆除点，消除"两个任务共享一个 Notify"这类漂移的复发面，随 B50）、O9 配置校验集中 ✅（`SplitterConfig::validate()`/`ReassemblerConfig::validate()` 收敛 chunk_size + 零值超时校验，可单测，E4 部分落地；随 B55）；各轮实施细节见 CHANGELOG Phase 16/17
 > - **v1.10.13（已实施，Phase 18）**：B57 链路空闲回收 ✅（`last_recv_ms` + `sweep_idle`，静默连接不再永久占用链路槽位，600s 无入站流量即回收重建）；e2e 拆除链覆盖 ✅（`client_disconnect_propagates_teardown`）
 > - **v1.10.14（已实施，Phase 19）**：B58 重排窗口修复 ✅（默认 64MB 且可配置 `reorder_window_bytes`，条目上限随字节预算推导——线上 4 隧道下载必断问题）
+> - **v1.10.15（已实施，Phase 20）**：B59 空闲清扫双向化 ✅（`last_active_ms` 由读写两侧盖章，单向长传输不再被误回收）
 > - **仍开放**：O3（send_async 选择器优化，当前实现正确、收益有限）、E2/E3（常量集中/统计字段抽取，纯重构）、E4 剩余（端口 bind 失败可见性——评估后保持现状：部分降级 + error 日志比 fail-fast 更抗 crash-loop）、Prometheus 端点、D4（UDP ICMP 透传）、其余超时常量可配置化（O5 模式已铺好）、UDP 域名解析缓存（当前 5s 超时逐报解析已可接受）
 
 ## 优先级总览

@@ -6,6 +6,32 @@
 
 ---
 
+## Phase 20: 链路空闲清扫方向盲区修复（v1.10.15）
+
+> **基线**: v1.10.14
+> **来源**: 第八轮复查——B57 的空闲清扫只统计入站帧活动，而纯下载时 reassembler 侧隧道只出站、纯上传时 splitter 侧隧道只出站：超过 `LINK_IDLE_TIMEOUT`(600s) 的单向大传输会被误判空闲而回收，传输中断。
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/tunnel.rs` | `TunnelLink.last_recv_ms` 改名 `last_active_ms`；`drain_frames` 每次写出成功后盖章（与读循环的入站盖章对称——双向任一活动都刷新时钟）；`sweep_idle` 注释更新为双向语义；新增 1 个单测 | B59 |
+| `src/splitter.rs` / `src/reassembler.rs` | 读循环盖章注释与字段名同步 | B59 |
+| `Cargo.toml` | 版本 1.10.14 → 1.10.15 | 发布 |
+
+### 行为变化
+
+- **B59 修复**: 空闲清扫改为"双向均无活动才回收"——静默连接占用槽位的防护（B57）保持不变，但单向长传输（>10 分钟的上传或下载）不再被误判回收
+
+### 测试结果
+
+- `cargo test`: 59/59 单元测试（新增 `drain_writes_stamp_link_activity`）+ 5/5 e2e 集成测试通过
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 19: 重排窗口溢出修复（v1.10.14）
 
 > **基线**: v1.10.13

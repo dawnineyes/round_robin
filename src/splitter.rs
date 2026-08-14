@@ -205,7 +205,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                             frames_recv: AtomicU64::new(0),
                             stop: Arc::new(tokio::sync::Notify::new()),
                             writer_died: Arc::new(tokio::sync::Notify::new()),
-                            last_recv_ms: AtomicU64::new(crate::tunnel::now_millis()),
+                            last_active_ms: AtomicU64::new(crate::tunnel::now_millis()),
                             lost_frames: Mutex::new(Vec::new()),
                             rate_bps: AtomicU64::new(0),
                         });
@@ -537,8 +537,9 @@ async fn tunnel_read_loop(
         handle_inbound_frame(frame, conns, pool, time_wait, resets);
         link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         link.frames_recv.fetch_add(1, Ordering::Relaxed);
-        // B57: inbound activity stamps the link's liveness clock.
-        link.last_recv_ms
+        // B57/B59: inbound activity stamps the link's liveness clock
+        // (the drain task stamps outbound writes — both directions).
+        link.last_active_ms
             .store(crate::tunnel::now_millis(), Ordering::Relaxed);
     }
 }
@@ -1175,7 +1176,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(tokio::sync::Notify::new()),
             writer_died: Arc::new(tokio::sync::Notify::new()),
-            last_recv_ms: AtomicU64::new(crate::tunnel::now_millis()),
+            last_active_ms: AtomicU64::new(crate::tunnel::now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });

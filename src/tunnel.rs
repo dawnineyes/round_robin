@@ -55,10 +55,14 @@ pub struct TunnelLink {
     /// stack's RTO gives up (minutes), delaying the reconnect — the
     /// drain's own write-stall timeout (60s) now bounds it.
     pub writer_died: Arc<Notify>,
-    /// B57: last inbound frame time (ms since epoch, `now_millis()`).
-    /// Updated by the read loop; the heartbeat's `sweep_idle` recycles
-    /// links that stayed silent for `LINK_IDLE_TIMEOUT`.
-    pub last_recv_ms: AtomicU64,
+    /// B57/B59: last activity time (ms since epoch, `now_millis()`),
+    /// stamped by BOTH directions — the read loop on inbound frames, the
+    /// drain task on outbound writes.  The heartbeat's `sweep_idle`
+    /// recycles links silent in both directions for `LINK_IDLE_TIMEOUT`;
+    /// inbound-only would kill long one-directional transfers (a pure
+    /// upload is outbound-only on the splitter, a pure download is
+    /// outbound-only on the reassembler).
+    pub last_active_ms: AtomicU64,
     /// Frames that were queued but never written when the link died.
     pub lost_frames: Mutex<Vec<Frame>>,
     /// EWMA of drain throughput in bytes/sec (f64 bits).  Written only by
@@ -129,21 +133,21 @@ impl TunnelPool {
         }
     }
 
-    /// B57: recycle live links that saw no inbound traffic for
-    /// `idle_limit`.  A silent TCP connection otherwise squats a link
-    /// slot forever (the reader task blocked in read, the writer idle) —
-    /// MAX_TUNNEL_LINKS of them would permanently reject real tunnels.
-    /// Marking the link dead + firing `stop` tears it down through the
-    /// existing chain: drain exits → `writer_died` → read loop exits →
-    /// the owner reconnects (splitter) or frees the slot (reassembler).
-    /// Returns the number of links recycled.
+    /// B57/B59: recycle live links with no activity in EITHER direction
+    /// for `idle_limit`.  A silent TCP connection otherwise squats a
+    /// link slot forever (the reader task blocked in read, the writer
+    /// idle) — MAX_TUNNEL_LINKS of them would permanently reject real
+    /// tunnels.  Marking the link dead + firing `stop` tears it down
+    /// through the existing chain: drain exits → `writer_died` → read
+    /// loop exits → the owner reconnects (splitter) or frees the slot
+    /// (reassembler).  Returns the number of links recycled.
     pub fn sweep_idle(&self, now_ms: u64, idle_limit: std::time::Duration) -> usize {
         let idle_limit_ms = idle_limit.as_millis() as u64;
         let links = self.links.lock().unwrap();
         let mut swept = 0;
         for l in links.iter() {
             if l.alive.load(Ordering::Acquire)
-                && now_ms.saturating_sub(l.last_recv_ms.load(Ordering::Relaxed)) > idle_limit_ms
+                && now_ms.saturating_sub(l.last_active_ms.load(Ordering::Relaxed)) > idle_limit_ms
             {
                 l.alive.store(false, Ordering::Release);
                 l.stop.notify_one();
@@ -389,6 +393,10 @@ where
                             Ok(Ok(())) => {
                                 link.bytes_sent.fetch_add(n, Ordering::Relaxed);
                                 link.frames_sent.fetch_add(1, Ordering::Relaxed);
+                                // B59: outbound writes are activity too —
+                                // the idle sweep must not recycle a link
+                                // carrying a one-directional transfer.
+                                link.last_active_ms.store(now_millis(), Ordering::Relaxed);
                                 // Phase 14: update the drain-rate EWMA.
                                 let now = std::time::Instant::now();
                                 let dt = now.duration_since(last_sample).as_secs_f64();
@@ -475,7 +483,7 @@ mod tests {
                 frames_recv: AtomicU64::new(0),
                 stop: Arc::new(Notify::new()),
                 writer_died: Arc::new(Notify::new()),
-                last_recv_ms: AtomicU64::new(now_millis()),
+                last_active_ms: AtomicU64::new(now_millis()),
                 lost_frames: Mutex::new(Vec::new()),
                 rate_bps: AtomicU64::new(0),
             })
@@ -503,7 +511,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(now_millis()),
+            last_active_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -588,7 +596,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(now_millis()),
+            last_active_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -623,7 +631,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(now_millis()),
+            last_active_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -649,7 +657,7 @@ mod tests {
         let fresh = mk_link(tx1, 0.0);
         let stale = mk_link(tx2, 0.0);
         stale
-            .last_recv_ms
+            .last_active_ms
             .store(now_millis() - 601_000, Ordering::Relaxed);
         pool.add(fresh.clone());
         pool.add(stale.clone());
@@ -666,6 +674,44 @@ mod tests {
         assert_eq!(pool.sweep_idle(now_millis(), LINK_IDLE_TIMEOUT), 0);
     }
 
+    /// B59 regression: outbound writes must stamp link activity — the
+    /// idle sweep used to see inbound frames only, so a long pure-upload
+    /// (splitter side) or pure-download (reassembler side) looked idle
+    /// and was recycled mid-transfer after LINK_IDLE_TIMEOUT.
+    #[tokio::test]
+    async fn drain_writes_stamp_link_activity() {
+        let (peer, wr) = tokio::io::duplex(65536);
+        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let link = mk_link(tx, 0.0);
+        let pool = TunnelPool::new();
+        pool.add(link.clone());
+        // Stale clock: the sweep would recycle this link right now…
+        link.last_active_ms
+            .store(now_millis() - 601_000, Ordering::Relaxed);
+        let task = tokio::spawn(drain_frames(rx, wr, link.clone()));
+        link.tx
+            .send(Frame::data(1, 1, bytes::Bytes::from_static(b"x")))
+            .await
+            .unwrap();
+        // …but an outbound write refreshes it.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while link.frames_sent.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drain did not write the frame");
+        let active = link.last_active_ms.load(Ordering::Relaxed);
+        assert!(
+            now_millis().saturating_sub(active) < 5_000,
+            "outbound write must stamp link activity"
+        );
+        assert_eq!(pool.sweep_idle(now_millis(), LINK_IDLE_TIMEOUT), 0);
+        link.stop.notify_one();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        drop(peer);
+    }
+
     #[tokio::test]
     async fn send_async_delivers_to_live_link() {
         let pool = TunnelPool::new();
@@ -679,7 +725,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(now_millis()),
+            last_active_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -702,7 +748,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
-            last_recv_ms: AtomicU64::new(now_millis()),
+            last_active_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(rate.to_bits()),
         })
