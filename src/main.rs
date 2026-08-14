@@ -1,16 +1,8 @@
 #![windows_subsystem = "windows"]
 
-mod config;
-mod frame;
-mod logging;
-mod reassembler;
-mod reorder;
-mod socks5;
-mod splitter;
-mod tunnel;
-
 use anyhow::{Result, bail};
-use config::{find_config, parse_ports};
+use round_robin::config::{find_config, parse_ports};
+use round_robin::{frame, logging, reassembler, splitter};
 use std::path::PathBuf;
 
 // ── Main ──────────────────────────────────────────────────────────────
@@ -18,10 +10,11 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<()> {
     let content = find_config()?;
-    let cfg: config::Config = toml::from_str(&content)?;
+    let cfg: round_robin::config::Config = toml::from_str(&content)?;
 
     // File logging: daily rotation, no ANSI, compact format
-    let log_dir = config::exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    let log_dir =
+        round_robin::config::exe_dir().unwrap_or_else(|| PathBuf::from("."));
     if cfg.log {
         let writer = logging::DailyLogWriter::new(log_dir.clone(), "round_robin", 7)
             .expect("failed to create log writer");
@@ -45,10 +38,21 @@ async fn main() -> Result<()> {
         }
         "reassembler" => {
             let rc = cfg.reassembler.as_ref();
+            let ports = match rc {
+                Some(r) => match parse_ports(&r.ports) {
+                    Ok(v) => v.len(),
+                    // BUG-20: don't swallow the error — surface it in the
+                    // banner; the real failure still happens below.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid reassembler.ports in config");
+                        0
+                    }
+                },
+                None => 0,
+            };
             (
                 rc.map(|r| r.local_target.to_string()).unwrap_or_default(),
-                rc.map(|r| parse_ports(&r.ports).map(|v| v.len()).unwrap_or(0))
-                    .unwrap_or(0),
+                ports,
             )
         }
         _ => (String::new(), 0),

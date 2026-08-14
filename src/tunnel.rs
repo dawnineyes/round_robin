@@ -1,8 +1,9 @@
-use crate::frame::Frame;
+use crate::frame::{Frame, MAX_PAYLOAD};
+use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// Per-tunnel send queue capacity. At 65535 bytes max frame, 128
 /// entries = ~8 MB max backlog per tunnel before backpressure kicks in.
@@ -17,6 +18,11 @@ pub struct TunnelLink {
     pub bytes_recv: AtomicU64,
     pub frames_sent: AtomicU64,
     pub frames_recv: AtomicU64,
+    /// Fires when the link dies: the drain task stops writing, drains the
+    /// queue and reports frames that were never written (D1 fast recovery).
+    pub stop: Arc<Notify>,
+    /// Frames that were queued but never written when the link died.
+    pub lost_frames: Mutex<Vec<Frame>>,
 }
 
 // ── Tunnel pool ────────────────────────────────────────────────────────
@@ -42,6 +48,16 @@ impl TunnelPool {
         self.links.lock().unwrap().len()
     }
 
+    /// Count only alive links (BUG-17: link caps must ignore dead links
+    /// that haven't been compacted by the heartbeat yet).
+    pub fn alive_count(&self) -> usize {
+        let links = self.links.lock().unwrap();
+        links
+            .iter()
+            .filter(|l| l.alive.load(Ordering::Acquire))
+            .count()
+    }
+
     /// Remove dead links from the pool. Called periodically from heartbeat.
     pub fn compact(&self) {
         let mut links = self.links.lock().unwrap();
@@ -61,6 +77,16 @@ impl TunnelPool {
             .filter(|l| l.alive.load(Ordering::Acquire))
             .count();
         (alive, total)
+    }
+
+    /// Sum of queued-but-unwritten frames across all links — a backlog
+    /// proxy for monitoring (heartbeat).
+    pub fn queue_depth(&self) -> usize {
+        let links = self.links.lock().unwrap();
+        links
+            .iter()
+            .map(|l| TUNNEL_CHANNEL_CAP - l.tx.capacity())
+            .sum()
     }
 
     /// Round-robin send with backpressure.  Uses `try_send` so that a
@@ -131,6 +157,12 @@ impl TunnelPool {
 
 // ── Drain frames ───────────────────────────────────────────────────────
 
+impl Default for TunnelPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A tunnel write stalled for this long is a dead link — drop it so the
 /// channel closes and senders fail over to other tunnels.
 const TUNNEL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -140,14 +172,42 @@ pub async fn drain_frames(
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     link: Arc<TunnelLink>,
 ) {
-    while let Some(frame) = rx.recv().await {
-        let n = frame.payload.len() as u64;
-        match tokio::time::timeout(TUNNEL_WRITE_TIMEOUT, wr.write_all(&frame.encode())).await {
-            Ok(Ok(())) => {}
-            _ => break, // write error or stall timeout
+    // O2: one reusable encode buffer per tunnel (no per-frame alloc).
+    let mut enc = BytesMut::with_capacity(15 + MAX_PAYLOAD);
+    let mut dead = false;
+    while !dead {
+        tokio::select! {
+            _ = link.stop.notified() => dead = true,
+            frame = rx.recv() => {
+                let Some(frame) = frame else { dead = true; continue; };
+                let n = frame.payload.len() as u64;
+                enc.clear();
+                // BUG-12: encode can fail (oversized payload) instead of
+                // truncating and corrupting the byte stream.
+                if let Err(e) = frame.encode_into(&mut enc) {
+                    tracing::warn!(error = %e, conn_id = frame.conn_id, "encode failed, dropping frame");
+                    dead = true;
+                    continue;
+                }
+                tokio::select! {
+                    _ = link.stop.notified() => dead = true,
+                    r = tokio::time::timeout(TUNNEL_WRITE_TIMEOUT, wr.write_all(&enc)) => {
+                        match r {
+                            Ok(Ok(())) => {
+                                link.bytes_sent.fetch_add(n, Ordering::Relaxed);
+                                link.frames_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => dead = true, // write error or stall timeout
+                        }
+                    }
+                }
+            }
         }
-        link.bytes_sent.fetch_add(n, Ordering::Relaxed);
-        link.frames_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    // D1: frames still queued were never written — report them so the
+    // owner can reset the affected connections / resend control frames.
+    while let Ok(frame) = rx.try_recv() {
+        link.lost_frames.lock().unwrap().push(frame);
     }
     let _ = wr.shutdown().await;
 }
@@ -163,6 +223,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alive_count_ignores_dead_links() {
+        let pool = TunnelPool::new();
+        let (tx1, rx1) = mpsc::channel::<Frame>(4);
+        let (tx2, rx2) = mpsc::channel::<Frame>(4);
+        let mk = |tx| {
+            Arc::new(TunnelLink {
+                tx,
+                alive: AtomicBool::new(true),
+                bytes_sent: AtomicU64::new(0),
+                bytes_recv: AtomicU64::new(0),
+                frames_sent: AtomicU64::new(0),
+                frames_recv: AtomicU64::new(0),
+                stop: Arc::new(Notify::new()),
+                lost_frames: Mutex::new(Vec::new()),
+            })
+        };
+        let live = mk(tx1);
+        let dead = mk(tx2);
+        dead.alive.store(false, Ordering::Release);
+        pool.add(live);
+        pool.add(dead);
+        drop((rx1, rx2));
+        assert_eq!(pool.link_count(), 2);
+        assert_eq!(pool.alive_count(), 1); // BUG-17
+    }
+
+    #[tokio::test]
     async fn send_async_fails_over_closed_channel() {
         let pool = TunnelPool::new();
         let (tx, rx) = mpsc::channel::<Frame>(4);
@@ -173,6 +260,8 @@ mod tests {
             bytes_recv: AtomicU64::new(0),
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
+            stop: Arc::new(Notify::new()),
+            lost_frames: Mutex::new(Vec::new()),
         });
         pool.add(link);
         drop(rx); // receiver gone → channel closed
@@ -190,6 +279,8 @@ mod tests {
             bytes_recv: AtomicU64::new(0),
             frames_sent: AtomicU64::new(0),
             frames_recv: AtomicU64::new(0),
+            stop: Arc::new(Notify::new()),
+            lost_frames: Mutex::new(Vec::new()),
         });
         pool.add(link);
         assert!(pool.send_async(Frame::rst(1)).await);

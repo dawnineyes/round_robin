@@ -1,6 +1,6 @@
 [package]
 name = "round_robin"
-version = "1.10.4"
+version = "1.10.6"
 edition = "2024"
 
 [[bin]]
@@ -21,3 +21,5 @@ rand = "0.8"
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
+strip = true

@@ -1,5 +1,6 @@
 use crate::frame::{
-    self, FLAG_DATA, FLAG_FIN, FLAG_RST, Frame, FrameDecoder, SynTarget, UDP_CONN_ID,
+    self, FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, PROTO_UDP, Frame, FrameDecoder, SynTarget,
+    UDP_CONN_ID,
 };
 use crate::reorder::ReorderBuf;
 use crate::socks5;
@@ -8,7 +9,7 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,17 +47,39 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// DATA send timeout: no live tunnel can take the frame within this
 /// window → the connection cannot proceed.
 const DATA_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// SOCKS5 handshake timeout (BUG-6): a peer that stalls mid-handshake
+/// must not pin a task and a socket forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max wait after our FIN for in-flight DATA (remote fin_seq) before
+/// force-closing (BUG-2). A dead tunnel can never deliver the gap, so
+/// the wait must be bounded.
+const CLOSE_GRACE_MAX: Duration = Duration::from_secs(15);
+/// When no remote FIN arrives at all, tear down after this much quiet
+/// time (no inbound DATA).  Generous enough for slowly-streaming
+/// targets, short enough to reclaim conns from a dead reassembler.
+const CLOSE_QUIET_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct VirtConn {
     to_client_tx: mpsc::Sender<Bytes>,
     reorder: Mutex<ReorderBuf>,
     /// Woken on FIN/RST so the client read loop can exit.
     notify: tokio::sync::Notify,
+    /// Teardown requested: RST / overflow / idle sweep.  A remote FIN is
+    /// NOT a teardown (D3 — it's a half-close).
     closed: AtomicBool,
     /// FIN received from reassembler (close initiated remotely).
     fin_received: AtomicBool,
+    /// BUG-2: FIN's seq = next_seq — all frames below it must be
+    /// delivered before the connection may be torn down.
+    fin_seq: AtomicU64,
+    /// The client loop has exited and the handler is inside the FIN
+    /// grace wait — the heartbeat must not sweep this conn (D3).
+    grace_waiting: AtomicBool,
     /// Reset received or triggered locally (reorder/channel overflow).
     rst: AtomicBool,
+    /// UDP relay connections bypass the reorder buffer entirely
+    /// (datagrams have no ordering semantics) — BUG-3/B19.
+    is_udp: bool,
     created_at: Instant,
     last_active: Mutex<Instant>,
     bytes_sent: AtomicU64,
@@ -104,14 +127,21 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
     let time_wait: Arc<DashMap<u32, Instant>> = Arc::new(DashMap::new());
     const TIME_WAIT_TTL: Duration = Duration::from_secs(60);
 
-    // Graceful shutdown signal.
+    // Graceful shutdown signal (SIGINT + SIGTERM on unix — BUG-13).
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let ctrl_c_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("ctrl+c received, shutting down");
+        crate::shutdown_signal().await;
+        info!("shutdown signal received, shutting down");
         ctrl_c_shutdown.store(true, Ordering::Release);
     });
+
+    // Connection reset counter (observability: logged by the heartbeat).
+    let resets: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // BUG-6: count handshakes in flight — conns only holds entries after
+    // the SOCKS5 handshake completes, so the connection-limit check would
+    // otherwise be bypassed by an unbounded number of stalled handshakes.
+    let half_open: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // 1. Establish persistent tunnel connections (with reconnect)
     for (i, ep) in cfg.tunnels.iter().enumerate() {
@@ -120,6 +150,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
         let conns = conns.clone();
         let time_wait = time_wait.clone();
         let shutdown = shutdown.clone();
+        let resets = resets.clone();
         tokio::spawn(async move {
             let mut retry_count: u32 = 0;
             loop {
@@ -136,18 +167,38 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                             bytes_recv: AtomicU64::new(0),
                             frames_sent: AtomicU64::new(0),
                             frames_recv: AtomicU64::new(0),
+                            stop: Arc::new(tokio::sync::Notify::new()),
+                            lost_frames: Mutex::new(Vec::new()),
                         });
                         pool.add(link.clone());
 
                         let wr_task = tokio::spawn(drain_frames(rx, wr, link.clone()));
 
                         if let Err(e) =
-                            tunnel_read_loop(rd, i, &conns, &pool, &link, &time_wait).await
+                            tunnel_read_loop(rd, i, &conns, &pool, &link, &time_wait, &resets).await
                         {
                             warn!(tunnel = i, error = %e, "read loop ended");
                         }
                         link.alive.store(false, Ordering::Release);
-                        wr_task.abort();
+                        // Tell the drain task to stop and drain its queue.
+                        link.stop.notify_one();
+                        let _ = wr_task.await;
+                        // D1 fast recovery: frames that were queued but
+                        // never written are lost forever.  Resend control
+                        // frames; reset connections that lost DATA.
+                        let lost = std::mem::take(&mut *link.lost_frames.lock().unwrap());
+                        for f in lost {
+                            if f.flags & (FLAG_SYN | FLAG_FIN | FLAG_RST) != 0 {
+                                pool.send(f);
+                            } else if conns.contains_key(&f.conn_id) {
+                                warn!(
+                                    conn_id = f.conn_id,
+                                    tunnel = i,
+                                    "tunnel died with queued DATA, resetting connection"
+                                );
+                                reset_conn(&conns, &time_wait, &pool, &resets, f.conn_id);
+                            }
+                        }
                         // Log disconnect summary
                         info!(
                             tunnel = i,
@@ -170,18 +221,24 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 // O4: 3s cadence after a session that ran and ended,
                 // exponential backoff (3→6→12→24s) on repeated connect
                 // failures so a dead peer isn't hammered.
+                // BUG-15: the old formula produced 3,3,6,12,24.
                 let delay_secs = if retry_count == 0 {
                     3
                 } else {
-                    std::cmp::min(24u64, 3u64 << (retry_count - 1).min(3))
+                    std::cmp::min(24u64, 3u64 << retry_count.min(3))
                 };
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
         });
     }
 
-    // Wait for at least one tunnel
+    // Wait for at least one tunnel. BUG-9: honor shutdown while waiting —
+    // a bad proxy config used to make Ctrl+C impossible to exit.
     while pool.link_count() == 0 {
+        if shutdown.load(Ordering::Acquire) {
+            info!("shutting down before first tunnel connected");
+            return Ok(());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     info!(listen = %cfg.listen_addr, tunnels = pool.link_count(), "splitter ready");
@@ -198,6 +255,8 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
     let hb_udp_recv = udp_recv.clone();
     let hb_time_wait = time_wait.clone();
     let hb_shutdown = shutdown.clone();
+    let hb_resets = resets.clone();
+    let hb_half_open = half_open.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -205,6 +264,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 break;
             }
             let (alive, total) = hb_pool.stats();
+            let queue_depth = hb_pool.queue_depth();
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
             // Sweep expired TIME_WAIT entries
@@ -218,18 +278,36 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                     warn!(conn_id = cid, "sweeping orphaned connection");
                     return false;
                 }
-                // FIN-received connections: use short grace timeout (10s)
-                // to prevent lingering after remote close.
+                // FIN-received connections: the response stream is over.
+                // - grace wait (handler active, post-EOF): handler
+                //   manages its own 15s cap — never sweep here.
+                // - D3 wait (client still connected) or orphaned handler:
+                //   reclaim when complete or silent too long.
                 if vc.fin_received.load(Ordering::Acquire) {
+                    if vc.grace_waiting.load(Ordering::Acquire) {
+                        return true;
+                    }
+                    let fin_seq = vc.fin_seq.load(Ordering::Acquire);
+                    let complete = vc.reorder.lock().unwrap().is_complete_through(fin_seq);
                     let fin_idle = now
                         .duration_since(*vc.last_active.lock().unwrap())
                         .as_secs();
-                    if fin_idle > 10 {
-                        warn!(
-                            conn_id = cid,
-                            idle_secs = fin_idle,
-                            "FIN-received connection timeout"
-                        );
+                    let limit = if Arc::strong_count(vc) > 1 {
+                        TCP_IDLE_TIMEOUT.as_secs()
+                    } else {
+                        30
+                    };
+                    if complete || fin_idle > limit {
+                        if !complete {
+                            warn!(
+                                conn_id = cid,
+                                idle_secs = fin_idle,
+                                fin_seq,
+                                "FIN-received connection swept with in-flight frames"
+                            );
+                        }
+                        vc.closed.store(true, Ordering::Release);
+                        vc.notify.notify_one();
                         return false;
                     }
                     return true; // keep alive during grace period
@@ -238,7 +316,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 let idle = now
                     .duration_since(*vc.last_active.lock().unwrap())
                     .as_secs();
-                let timeout = if cid == UDP_CONN_ID {
+                let timeout = if vc.is_udp {
                     UDP_IDLE_TIMEOUT.as_secs()
                 } else {
                     TCP_IDLE_TIMEOUT.as_secs()
@@ -256,7 +334,11 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 uptime,
                 alive,
                 total,
+                queue_depth,
                 active_conns = hb_conns.len(),
+                half_open = hb_half_open.load(Ordering::Acquire),
+                time_wait = hb_time_wait.len(),
+                resets = hb_resets.swap(0, Ordering::Relaxed),
                 udp_sent = hb_udp_sent.swap(0, Ordering::Relaxed),
                 udp_recv = hb_udp_recv.swap(0, Ordering::Relaxed),
                 "heartbeat"
@@ -276,7 +358,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
             return Ok(());
         }
         // Check connection limit before accepting (coarse but fast check)
-        if conns.len() >= MAX_CONCURRENT_CONNS {
+        if conns.len() + half_open.load(Ordering::Acquire) >= MAX_CONCURRENT_CONNS {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
@@ -292,13 +374,12 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
         };
         let _ = stream.set_nodelay(true);
         // Random conn_id — collision probability ~ N²/2³² (< 0.01% at 1000 conns)
-        let conn_id = loop {
-            let id: u32 = rand::random();
-            if id == 0 {
-                continue; // reserved for UDP
-            }
-            if !conns.contains_key(&id) && !time_wait.contains_key(&id) {
-                break id;
+        let conn_id = match alloc_conn_id(&conns, &time_wait) {
+            Some(id) => id,
+            None => {
+                // Practically unreachable (2³² ids), but never loop forever.
+                warn!(peer = %peer, "conn_id space exhausted, dropping connection");
+                continue;
             }
         };
         let pool = pool.clone();
@@ -306,6 +387,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
         let time_wait = time_wait.clone();
         let us = udp_sent.clone();
         let ur = udp_recv.clone();
+        let half_open = half_open.clone();
 
         tokio::spawn(async move {
             let ctx = ClientCtx {
@@ -317,12 +399,28 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 chunk_size: cfg.chunk_size,
                 udp_sent: us,
                 udp_recv: ur,
+                half_open,
             };
             if let Err(e) = handle_client(stream, ctx).await {
                 warn!(conn_id, peer = %peer, error = %e, "client handler failed");
             }
         });
     }
+}
+
+/// Allocate a random conn_id that is neither in use nor in TIME_WAIT.
+/// Shared by the TCP accept path and per-association UDP relays (BUG-19).
+fn alloc_conn_id(conns: &DashMap<u32, Arc<VirtConn>>, time_wait: &DashMap<u32, Instant>) -> Option<u32> {
+    for _ in 0..1024 {
+        let id: u32 = rand::random();
+        if id == 0 {
+            continue; // reserved for legacy UDP relay
+        }
+        if !conns.contains_key(&id) && !time_wait.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 // ── Tunnel management ─────────────────────────────────────────────────
@@ -344,6 +442,7 @@ async fn tunnel_read_loop(
     pool: &TunnelPool,
     link: &TunnelLink,
     time_wait: &DashMap<u32, Instant>,
+    resets: &AtomicU64,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     loop {
@@ -352,7 +451,7 @@ async fn tunnel_read_loop(
             None => return Ok(()),
         };
         let plen = frame.payload.len() as u64;
-        handle_inbound_frame(frame, tunnel_idx, conns, pool, time_wait);
+        handle_inbound_frame(frame, tunnel_idx, conns, pool, time_wait, resets);
         link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         link.frames_recv.fetch_add(1, Ordering::Relaxed);
     }
@@ -366,6 +465,7 @@ fn handle_inbound_frame(
     conns: &ConnMap,
     pool: &TunnelPool,
     time_wait: &DashMap<u32, Instant>,
+    resets: &AtomicU64,
 ) {
     // Ignore control frames (FIN/RST/SYN) for UDP relay; only DATA is valid.
     if frame.conn_id == UDP_CONN_ID && frame.flags & FLAG_DATA == 0 {
@@ -374,6 +474,26 @@ fn handle_inbound_frame(
 
     if frame.flags & FLAG_DATA != 0 {
         if let Some(conn) = conns.get(&frame.conn_id) {
+            // BUG-3/B19: UDP relay DATA bypasses the reorder buffer —
+            // datagrams have no ordering semantics, and a single dropped
+            // response used to leave a permanent seq gap that eventually
+            // overflowed the window and killed the whole relay.
+            if conn.is_udp {
+                let plen = frame.payload.len() as u64;
+                if conn.to_client_tx.try_send(frame.payload).is_err() {
+                    // Client not draining (relay channel full) — drop the
+                    // datagram, best effort; never reset a UDP relay.
+                    warn!(
+                        conn_id = frame.conn_id,
+                        "UDP relay client channel full, dropping datagram"
+                    );
+                } else {
+                    conn.bytes_recv.fetch_add(plen, Ordering::Relaxed);
+                    conn.frames_recv.fetch_add(1, Ordering::Relaxed);
+                }
+                *conn.last_active.lock().unwrap() = Instant::now();
+                return;
+            }
             let overflow = conn.on_frame(frame.seq, frame.payload);
             drop(conn); // release the shard lock before remove()
             if overflow {
@@ -384,14 +504,7 @@ fn handle_inbound_frame(
                     seq = frame.seq,
                     "reorder/channel overflow, resetting connection"
                 );
-                if let Some((_, conn)) = conns.remove(&frame.conn_id) {
-                    time_wait.insert(frame.conn_id, Instant::now());
-                    conn.rst.store(true, Ordering::Release);
-                    conn.closed.store(true, Ordering::Release);
-                    conn.notify.notify_one();
-                    drop(conn);
-                }
-                pool.send(Frame::rst(frame.conn_id));
+                reset_conn(conns, time_wait, pool, resets, frame.conn_id);
             }
         } else if time_wait.contains_key(&frame.conn_id) {
             // Late DATA arrived after FIN but before TIME_WAIT expiry.
@@ -411,12 +524,16 @@ fn handle_inbound_frame(
 
     if frame.flags & FLAG_FIN != 0 {
         // Don't remove from conns immediately — late DATA frames may still
-        // be in-flight on other tunnels.  Just signal the client loop and
-        // let handle_tcp_client perform the actual removal after a grace
-        // period so in-flight DATA is not dropped with RST.
+        // be in-flight on other tunnels.  Record the FIN's next_seq so the
+        // client handler can wait for every in-flight frame before removal
+        // (BUG-2: the old fixed 3s grace dropped late DATA on slow tunnels).
         if let Some(conn) = conns.get(&frame.conn_id) {
+            if conn.is_udp {
+                return; // UDP has no FIN semantics
+            }
             conn.fin_received.store(true, Ordering::Release);
-            conn.closed.store(true, Ordering::Release);
+            conn.fin_seq.store(frame.seq, Ordering::Release);
+            // D3: FIN is a half-close — do NOT mark the conn closed.
             conn.notify.notify_one();
         }
         return;
@@ -424,14 +541,28 @@ fn handle_inbound_frame(
 
     if frame.flags & FLAG_RST != 0 {
         // RST = force-close, no grace period needed.
-        if let Some((_, conn)) = conns.remove(&frame.conn_id) {
-            time_wait.insert(frame.conn_id, Instant::now());
-            conn.rst.store(true, Ordering::Release);
-            conn.closed.store(true, Ordering::Release);
-            conn.notify.notify_one();
-            drop(conn);
-        }
+        reset_conn(conns, time_wait, pool, resets, frame.conn_id);
     }
+}
+
+/// Tear down a virtual connection and tell the peer to do the same.
+/// Used for reorder overflow, remote RST and tunnel-loss recovery (D1).
+fn reset_conn(
+    conns: &ConnMap,
+    time_wait: &DashMap<u32, Instant>,
+    pool: &TunnelPool,
+    resets: &AtomicU64,
+    conn_id: u32,
+) {
+    if let Some((_, conn)) = conns.remove(&conn_id) {
+        time_wait.insert(conn_id, Instant::now());
+        conn.rst.store(true, Ordering::Release);
+        conn.closed.store(true, Ordering::Release);
+        conn.notify.notify_one();
+        drop(conn);
+    }
+    pool.send(Frame::rst(conn_id));
+    resets.fetch_add(1, Ordering::Relaxed);
 }
 
 // ── Client handler ────────────────────────────────────────────────────
@@ -445,10 +576,18 @@ struct ClientCtx {
     chunk_size: usize,
     udp_sent: Arc<AtomicU64>,
     udp_recv: Arc<AtomicU64>,
+    half_open: Arc<AtomicUsize>,
 }
 
 async fn handle_client(stream: TcpStream, ctx: ClientCtx) -> Result<()> {
-    let accepted = socks5::socks5_server_accept(stream).await?;
+    // BUG-6: bound the SOCKS5 handshake — a stalled peer must not pin the
+    // task/socket forever — and count it against the connection limit.
+    ctx.half_open.fetch_add(1, Ordering::AcqRel);
+    let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, socks5::socks5_server_accept(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?;
+    ctx.half_open.fetch_sub(1, Ordering::AcqRel);
+    let accepted = accepted?;
     match accepted {
         socks5::Socks5Result::Connect(accepted) => {
             handle_tcp_client(
@@ -469,6 +608,7 @@ async fn handle_client(stream: TcpStream, ctx: ClientCtx) -> Result<()> {
             handle_udp_client(
                 &ctx.pool,
                 &ctx.conns,
+                &ctx.time_wait,
                 relay,
                 keepalive,
                 ctx.udp_sent.clone(),
@@ -504,7 +644,10 @@ async fn handle_tcp_client(
         notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         fin_received: AtomicBool::new(false),
+        fin_seq: AtomicU64::new(0),
+        grace_waiting: AtomicBool::new(false),
         rst: AtomicBool::new(false),
+        is_udp: false,
         created_at: Instant::now(),
         last_active: Mutex::new(Instant::now()),
         bytes_sent: AtomicU64::new(0),
@@ -519,6 +662,14 @@ async fn handle_tcp_client(
 
     if !pool.send(syn_frame) {
         conns.remove(&conn_id);
+        // BUG-10: the SOCKS5 success reply was already sent — tell the
+        // client the connection actually failed instead of a bare EOF.
+        let mut client_stream = accepted.stream;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
+        )
+        .await;
         bail!("no live tunnels to send SYN");
     }
 
@@ -578,31 +729,77 @@ async fn handle_tcp_client(
                 }
             }
             _ = vconn.notify.notified() => {
+                // D3: a remote FIN is a half-close, not a teardown —
+                // keep forwarding client data until the client closes its
+                // write half.  Only RST / overflow / idle sweep stop us.
                 if vconn.closed.load(Ordering::Acquire) {
                     close_reason = if vconn.rst.load(Ordering::Acquire) {
                         "rst"
-                    } else if vconn.fin_received.load(Ordering::Acquire) {
-                        "remote_fin"
                     } else {
                         "timeout"
                     };
                     break;
                 }
-                // FIN/RST notification — loop back to check closed flag
+                // Remote FIN or spurious notify — loop back to reading.
             }
         }
     }
 
     // FIN carries next_seq so the reassembler can half-close its egress
     // write side exactly when every in-flight frame has been delivered.
-    let _ =
-        tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(Frame::fin(conn_id, seq))).await;
-    // Grace period: wait for late DATA frames on other tunnels before
-    // removing from conns.  Without this, a FIN arriving on tunnel A
-    // would cause DATA frames still in-flight on tunnel B to trigger
-    // an RST response (data loss).
-    const FIN_GRACE_MS: u64 = 3000;
-    tokio::time::sleep(Duration::from_millis(FIN_GRACE_MS)).await;
+    // On RST the peer is already tearing down — no FIN needed.
+    let fin_sent = if close_reason == "rst" {
+        false
+    } else {
+        tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(Frame::fin(conn_id, seq)))
+            .await
+            .unwrap_or(false)
+    };
+    if !fin_sent && close_reason != "rst" {
+        // BUG-11: without a FIN the reassembler's egress would linger for
+        // up to the 300s idle sweep — send a best-effort RST instead so
+        // it tears down promptly.
+        warn!(conn_id, "FIN send failed, sending RST fallback");
+        pool.send(Frame::rst(conn_id));
+    }
+    // Grace period (BUG-2): wait for in-flight DATA on other tunnels
+    // before removing from conns.  Only meaningful for client-EOF closes:
+    // on RST/timeout/no_tunnel the connection is already broken and the
+    // wait would just pin the entry.  The reassembler's FIN carries
+    // next_seq — wait until the reorder buffer is complete through it,
+    // bounded by CLOSE_GRACE_MAX so a dead tunnel can't hang teardown.
+    // If no FIN arrives at all, keep the conn alive while responses keep
+    // flowing and tear down after CLOSE_QUIET_TIMEOUT of silence.
+    // grace_waiting tells the heartbeat to keep its hands off (D3).
+    if close_reason == "eof" {
+        vconn.grace_waiting.store(true, Ordering::Release);
+        let mut fin_seen_at: Option<Instant> = None;
+        loop {
+            if vconn.fin_received.load(Ordering::Acquire) {
+                let fin_seq = vconn.fin_seq.load(Ordering::Acquire);
+                if vconn.reorder.lock().unwrap().is_complete_through(fin_seq) {
+                    break; // every in-flight frame below fin_seq delivered
+                }
+                let seen = *fin_seen_at.get_or_insert_with(Instant::now);
+                if seen.elapsed() >= CLOSE_GRACE_MAX {
+                    warn!(conn_id, "close grace expired with in-flight frames");
+                    break;
+                }
+            } else {
+                let idle = Instant::now()
+                    .duration_since(*vconn.last_active.lock().unwrap());
+                if idle >= CLOSE_QUIET_TIMEOUT {
+                    warn!(
+                        conn_id,
+                        idle_secs = idle.as_secs(),
+                        "close wait expired without FIN"
+                    );
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     // Move to TIME_WAIT before removing from conns so a new random
     // conn_id won't collide before the grace period expires.
     time_wait.insert(conn_id, Instant::now());
@@ -629,10 +826,13 @@ async fn handle_tcp_client(
 }
 
 /// UDP relay: read SOCKS5-wrapped datagrams → DATA frames → pool.
-/// Responses from reassembler arrive via handle_inbound_frame → conns[0] → relay socket.
+/// BUG-19: each association gets its own conn_id (allocated like a TCP
+/// conn and announced via SYN proto=UDP) — multiple clients can relay
+/// concurrently instead of fighting over UDP_CONN_ID.
 async fn handle_udp_client(
     pool: &TunnelPool,
     conns: &ConnMap,
+    time_wait: &DashMap<u32, Instant>,
     relay: UdpSocket,
     keepalive: TcpStream,
     udp_sent: Arc<AtomicU64>,
@@ -640,15 +840,10 @@ async fn handle_udp_client(
 ) -> Result<()> {
     let relay = Arc::new(relay);
     let relay_addr = relay.local_addr()?;
-    info!(addr = %relay_addr, "UDP relay started");
-
-    // BUG-4: all UDP clients share UDP_CONN_ID — a second association
-    // would overwrite the first one's entry and misroute its responses.
-    // Reject instead (single-client proxy).
-    if conns.contains_key(&UDP_CONN_ID) {
-        warn!("second UDP ASSOCIATE rejected — only one relay at a time");
-        return Ok(());
-    }
+    let conn_id = alloc_conn_id(conns, time_wait).ok_or_else(|| {
+        anyhow::anyhow!("conn_id space exhausted, cannot start UDP relay")
+    })?;
+    info!(conn_id, addr = %relay_addr, "UDP relay started");
 
     let (to_udp_tx, mut to_udp_rx) = mpsc::channel::<Bytes>(UDP_CHANNEL_CAP);
     let vconn = Arc::new(VirtConn {
@@ -657,7 +852,10 @@ async fn handle_udp_client(
         notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         fin_received: AtomicBool::new(false),
+        fin_seq: AtomicU64::new(0),
+        grace_waiting: AtomicBool::new(false),
         rst: AtomicBool::new(false),
+        is_udp: true,
         created_at: Instant::now(),
         last_active: Mutex::new(Instant::now()),
         bytes_sent: AtomicU64::new(0),
@@ -665,7 +863,23 @@ async fn handle_udp_client(
         frames_sent: AtomicU64::new(0),
         frames_recv: AtomicU64::new(0),
     });
-    conns.insert(UDP_CONN_ID, vconn.clone());
+    // Insert BEFORE the SYN (same BUG-6 rule as TCP): the reassembler
+    // creates its UDP vconn from the SYN, so early responses race safe.
+    conns.insert(conn_id, vconn.clone());
+
+    let syn = Frame::syn(
+        conn_id,
+        SynTarget {
+            proto: PROTO_UDP,
+            address: "0.0.0.0".into(),
+            port: 0,
+        }
+        .encode(),
+    );
+    if !pool.send(syn) {
+        conns.remove(&conn_id);
+        bail!("no live tunnels to send UDP SYN");
+    }
 
     // Track SOCKS5 client address so we can send_to (socket is unconnected).
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -709,7 +923,7 @@ async fn handle_udp_client(
                 };
                 *client_addr.lock().unwrap() = Some(client);
                 udp_sent.fetch_add(1, Ordering::Relaxed);
-                let frame = Frame::data(UDP_CONN_ID, seq, Bytes::copy_from_slice(&buf[..n]));
+                let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
                 let mut sent = false;
                 for _ in 0..3 {
                     if pool.send(frame.clone()) {
@@ -729,19 +943,21 @@ async fn handle_udp_client(
                 seq = seq.wrapping_add(1);
             }
             _ = &mut ka_rx => {
-                info!("UDP keepalive closed, ending relay");
+                info!(conn_id, "UDP keepalive closed, ending relay");
                 break;
             }
             _ = vconn.notify.notified() => {
                 // Swept by heartbeat / reset — stop the relay loop.
                 if vconn.closed.load(Ordering::Acquire) {
-                    info!("UDP relay closed by heartbeat/reset, ending relay");
+                    info!(conn_id, "UDP relay closed by heartbeat/reset, ending relay");
                     break;
                 }
             }
         }
     }
-    // BUG-4: only remove our own entry — never a newer relay's.
-    conns.remove_if(&UDP_CONN_ID, |_, v| Arc::ptr_eq(v, &vconn));
+    // Only remove our own entry — never a newer relay's. Best-effort RST
+    // so the reassembler drops the UDP vconn instead of idle-sweeping it.
+    conns.remove_if(&conn_id, |_, v| Arc::ptr_eq(v, &vconn));
+    pool.send(Frame::rst(conn_id));
     Ok(())
 }

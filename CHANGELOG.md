@@ -6,6 +6,83 @@
 
 ---
 
+## Phase 11: 快恢复 + 半关闭语义 + 性能（v1.10.6）
+
+> **基线**: v1.10.5  
+> **来源**: `OPTIMIZATION_PLAN.md` P3（D1/D3）与 P2 性能/工程项（O1/O2/O4/E1/E5）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/tunnel.rs` | `TunnelLink` 新增 `stop` Notify 与 `lost_frames`；`drain_frames` 复用编码缓冲（O2）+ stop 竞速写 + 死亡时上报未写出帧；`TunnelPool::queue_depth()` | D1/O2/指标 |
+| `src/splitter.rs` | 隧道死亡时重置丢帧连接、重发丢失的控制帧（D1）；远端 FIN 不再断开（D3 半关闭，继续转发客户端数据）；`grace_waiting` 标记保护 FIN grace；心跳增加 resets/queue_depth/half_open/time_wait 指标 | D1/D3/可观测性 |
+| `src/reassembler.rs` | egress EOF 后保留连接直到 splitter FIN 完成半关闭（`egress_eof` + `finish_if_done`）；丢帧回 RST/重发控制帧；心跳 resets/queue_depth 指标；egress reader 参数收敛为 `EgressReaderCtx` | D1/D3/clippy |
+| `src/frame.rs` | `try_next` 用 `read_buf` 直接读入解码缓冲（消除 8KB 栈拷贝）；`encode_into` 复用缓冲编码 | O1/O2 |
+| `Cargo.toml` | 版本 1.10.5 → 1.10.6；release 增加 `codegen-units=1` + `strip=true` | O4/发布 |
+| `.github/workflows/ci.yml`（新增） | push/PR 触发 build + clippy `-D warnings` + test | E1 |
+| `.github/workflows/release.yml` | 发布前加 clippy 与 test 门槛 | E1 |
+| `tests/e2e.rs` | 新增 D1 隧道死亡快恢复测试、D3 远端 FIN 后继续发送测试 | 回归 |
+| `README.md` | 端口示例与 config.example 对齐 + 默认值说明；v1.10.6 变更日志 | E5 |
+
+### 行为变化
+
+- **D1 隧道故障快恢复**: 隧道死亡时，队列中未写出的 DATA 帧导致对应连接立即重置（两端 RST），不再静默停滞直到重排窗口溢出（8MB）；未写出的 SYN/FIN/RST 自动重发
+- **D3 客户端侧半关闭**: 远端 FIN 只表示响应结束——splitter 继续转发客户端数据，egress 连接保留到客户端 FIN 才完整拆除；两个方向的关闭精确独立
+- **性能**: 帧解码零拷贝（read_buf 直读）；隧道写路径每帧少一次堆分配（复用编码缓冲）；release 加 codegen-units=1/strip
+- **可观测性**: 心跳日志新增隧道队列深度、连接重置计数、半开握手数、TIME_WAIT 数
+- **CI**: 新增 push/PR 流水线（clippy deny warnings + 全量测试），release 发布前同样跑门槛
+
+### 测试结果
+
+- `cargo test`: 20/20 单元测试 + 4/4 e2e 集成测试通过
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo build --release`: 成功
+
+---
+
+## Phase 10: Bug 审查修复（v1.10.5）
+
+> **基线**: v1.10.4  
+> **来源**: `BUG_REVIEW.md`（20 个 bug）+ `OPTIMIZATION_PLAN.md` P0/P1/P2
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/lib.rs`（新增） | 抽取 lib target + `shutdown_signal()`（SIGINT/SIGTERM） | 支持集成测试；BUG-13 |
+| `src/main.rs` | 模块迁移至 lib；横幅 parse_ports 错误 warn 不再吞 | BUG-20 |
+| `src/frame.rs` | `encode() → Result<Bytes>`（拒绝超长而非截断）；`PROTO_UDP`；`MAX_REORDER_BYTES`(8MB)；`MAX_PENDING_BYTES`(64MB) | BUG-12/19/8/7 |
+| `src/reorder.rs` | 窗口按字节预算（帧数上限保留）；测试更新 | BUG-8 |
+| `src/config.rs` | 端口去重（保留顺序 + warn）；范围上限 256；空端口集报错 | BUG-14 |
+| `src/tunnel.rs` | `alive_count()`；`drain_frames` 处理 encode 失败 | BUG-17/12 |
+| `src/logging.rs` | `DailyWriter` 循环完整写（处理部分写/Interrupted） | BUG-16 |
+| `src/splitter.rs` | FIN 携带 next_seq 精确半关闭（complete_through + 15s 兜底 / 60s 静默上限）；UDP 旁路重排；SOCKS5 握手 15s 超时 + 半开连接计数；SYN 失败回 REP_GENERAL_FAILURE；FIN 发送失败回 RST；退避 3→6→12→24 修正；多客户端 UDP（每关联独立 conn_id + SYN proto=0x11）；等首隧道响应 shutdown | BUG-2/3/6/9/10/11/15/19 |
+| `src/reassembler.rs` | FIN/RST 在 SYN 握手期排队进 pending（FIN 半关闭、RST 取消建连 + select 竞速）；`close_write_half` 三态状态机；pending 字节预算 + 最旧驱逐；UDP 每连接独立 v4/v6 socket 对 + 独立响应读取任务（同目标多客户端不再串流）；UDP seq 仅在成功发送后递增；双栈 UDP（Windows WSAEADDRNOTAVAIL 兼容）；隧道链路上限只数活链；心跳清理 pending 字节与日志 | BUG-1/3/4/5/7/17/18/19 |
+| `install.sh` | systemd 单元补 `KillSignal=SIGTERM` + `TimeoutStopSec=10` | BUG-13 |
+| `tests/e2e.rs`（新增） | 端到端集成测试：3 隧道（1 慢）乱序重组 + FIN-before-SYN 竞态 + 双客户端 UDP 并发 | F9/回归 |
+| `Cargo.toml` | 版本 1.10.4 → 1.10.5 | 发布 |
+| `README.md` | 协议节补 UDP 每关联 conn_id 语义 | 文档 |
+
+### 行为变化
+
+- **修复**: FIN 先于 SYN 到达（异构隧道延迟）不再被丢弃——egress 照常半关闭，依赖 EOF 的协议不再挂死 300s（BUG-1）
+- **修复**: splitter 收到 FIN 后按 next_seq 等待在途 DATA，慢隧道响应不再被 3s 固定 grace 截断（BUG-2）
+- **修复**: UDP 响应丢弃不再产生永久 seq 空洞杀死整个中继；UDP 完全旁路重排缓冲（BUG-3）
+- **修复**: SYN 握手期 RST 可中止在建 egress 连接（BUG-4）；half-close 状态机消除强制兜底丢失竞态（BUG-5）
+- **修复**: SOCKS5 握手 15s 超时且计入 4096 连接上限；pending 帧字节预算 64MB（理论峰值 4.3GB→64MB）；重排窗口 32MB/连接→8MB/连接（BUG-6/7/8）
+- **修复**: 多客户端 UDP ASSOCIATE 并发中继，同目标不再互相串流（每关联独立 conn_id 与 socket）（BUG-19）
+- **修复**: IPv6 UDP 目标（双栈 socket 对）；Windows 双栈 sendto 兼容（BUG-18）
+- **改进**: 无隧道时 SOCKS 客户端收到明确失败应答；FIN 发不出时回 RST 避免对端 300s 泄漏；SIGTERM 优雅关闭；端口配置去重校验（BUG-10/11/13/14/16/17/20）
+
+### 测试结果
+
+- `cargo test`: 20/20 单元测试 + 2/2 e2e 集成测试通过
+- `cargo clippy --all-targets`: 0 warnings
+- `cargo build --release`: 成功
+
+---
+
 ## Phase 9: Bug 审查修复 + 背压重构 (v1.10.4)
 
 > **基线**: v1.10.3  

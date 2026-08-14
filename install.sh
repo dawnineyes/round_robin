@@ -61,6 +61,9 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/${BINARY}
 Restart=always
 RestartSec=3
+# BUG-13: the daemon handles SIGTERM gracefully; give it a bounded window.
+KillSignal=SIGTERM
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target

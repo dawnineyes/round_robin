@@ -71,7 +71,24 @@ impl<'a> Write for DailyWriter<'a> {
             // Best-effort purge (once per day, first write after midnight)
             purge_old_logs(self.dir, self.prefix, self.keep_days);
         }
-        state.file.write(buf)
+        // BUG-16: Write allows partial writes, but tracing's fmt layer
+        // assumes a full write — loop until everything is out or an
+        // error occurs, so log lines never interleave or truncate.
+        let mut written = 0;
+        while written < buf.len() {
+            match state.file.write(&buf[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "log file write returned 0",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {

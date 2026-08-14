@@ -21,12 +21,20 @@ pub const MAX_PAYLOAD: usize = 65535;
 pub const MIN_CHUNK: usize = 512;
 pub const MAX_CHUNK: usize = 65535;
 
-/// Reserved conn_id for UDP relay traffic.
+/// Reserved conn_id for legacy UDP relay traffic (single-client mode).
+/// v1.10.5+ allocates a real conn_id per UDP association instead.
 pub const UDP_CONN_ID: u32 = 0;
 /// Max out-of-order entries before new arrivals are dropped.
 pub const MAX_REORDER_WINDOW: usize = 512;
+/// BUG-8 fix: byte budget for the reorder window, independent of frame
+/// count. 512 frames × 64 KB = 32 MB/connection was too much; 8 MB caps
+/// memory while keeping the window large enough for high-BDP tunnels.
+pub const MAX_REORDER_BYTES: usize = 8 * 1024 * 1024;
 /// Max number of pending CIDs with DATA-before-SYN buffered (reassembler).
 pub const MAX_PENDING_CIDS: usize = 256;
+/// BUG-7 fix: global byte budget for pending DATA-before-SYN frames.
+/// 256 CIDs × 256 frames × 64 KB ≈ 4.3 GB theoretical; cap at 64 MB.
+pub const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 // ── Frame ─────────────────────────────────────────────────────────────
 
@@ -75,28 +83,39 @@ impl Frame {
         }
     }
 
-    pub fn encode(&self) -> Bytes {
-        // Callers must never build a frame larger than the u16 length
-        // field can express — truncating here would corrupt the stream
-        // (the tail would be parsed as the next frame header).
-        debug_assert!(
-            self.payload.len() <= MAX_PAYLOAD,
-            "frame payload too large: {} > {MAX_PAYLOAD}",
-            self.payload.len()
-        );
+    /// Encode the frame to wire format.  Returns an error instead of
+    /// truncating when the payload exceeds the u16 length field —
+    /// truncation would corrupt the stream (the tail would be parsed as
+    /// the next frame header).
+    pub fn encode(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(HEADER_LEN + self.payload.len());
+        self.encode_into(&mut buf)?;
+        Ok(buf.freeze())
+    }
+
+    /// Encode into a reusable buffer (O2: avoids one allocation per
+    /// frame on the tunnel write path).
+    pub fn encode_into(&self, buf: &mut BytesMut) -> Result<()> {
+        if self.payload.len() > MAX_PAYLOAD {
+            bail!(
+                "frame payload too large: {} > {MAX_PAYLOAD}",
+                self.payload.len()
+            );
+        }
+        buf.reserve(HEADER_LEN + self.payload.len());
         buf.put_u32(self.conn_id);
         buf.put_u64(self.seq);
         buf.put_u8(self.flags);
         buf.put_u16(self.payload.len() as u16);
         buf.put_slice(&self.payload);
-        buf.freeze()
+        Ok(())
     }
 }
 
 // ── SYN payload helpers ───────────────────────────────────────────────
 
 pub const PROTO_TCP: u8 = 0x06;
+pub const PROTO_UDP: u8 = 0x11;
 
 #[derive(Debug, Clone)]
 pub struct SynTarget {
@@ -184,9 +203,15 @@ impl FrameDecoder {
                 }
             }
 
-            // Need more data: read into a temp buffer, append
-            let mut tmp = [0u8; 8192];
-            let n = rd.read(&mut tmp).await?;
+            // Need more data: read directly into the decoder buffer
+            // (O1: no 8 KB stack buffer + copy).  Bound the read so a
+            // malformed / malicious peer can never blow past the limit.
+            let space = MAX_DECODER_BUF.saturating_sub(self.buf.len());
+            if space == 0 {
+                bail!("frame decoder buffer overflow (> {MAX_DECODER_BUF} bytes)");
+            }
+            self.buf.reserve(space.min(8192));
+            let n = rd.read_buf(&mut self.buf).await?;
             if n == 0 {
                 return if self.buf.is_empty() {
                     Ok(None)
@@ -194,18 +219,13 @@ impl FrameDecoder {
                     bail!("EOF mid-frame ({} buffered bytes)", self.buf.len())
                 };
             }
-            // Guard against unbounded growth from malformed / malicious peers
-            // that never send a complete frame.
-            if self.buf.len() + n > MAX_DECODER_BUF {
-                bail!(
-                    "frame decoder buffer overflow ({} + {} > {})",
-                    self.buf.len(),
-                    n,
-                    MAX_DECODER_BUF
-                );
-            }
-            self.buf.extend_from_slice(&tmp[..n]);
         }
+    }
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -236,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn decoder_single_frame() {
         let f = Frame::data(1, 42, Bytes::from_static(b"payload"));
-        let encoded = f.encode().to_vec();
+        let encoded = f.encode().unwrap().to_vec();
         let mut decoder = FrameDecoder::new();
         let mut reader = BufReader(encoded, 0);
         let got = decoder.try_next(&mut reader).await.unwrap().unwrap();
@@ -251,8 +271,8 @@ mod tests {
         let f1 = Frame::data(1, 1, Bytes::from_static(b"aaa"));
         let f2 = Frame::data(1, 2, Bytes::from_static(b"bb"));
         let mut data = Vec::new();
-        data.extend_from_slice(&f1.encode());
-        data.extend_from_slice(&f2.encode());
+        data.extend_from_slice(&f1.encode().unwrap());
+        data.extend_from_slice(&f2.encode().unwrap());
 
         let mut decoder = FrameDecoder::new();
         let mut reader = BufReader(data, 0);
@@ -274,7 +294,7 @@ mod tests {
             }
             .encode(),
         );
-        let encoded = f.encode();
+        let encoded = f.encode().unwrap();
         let mut decoder = FrameDecoder::new();
 
         // ponytail: feed one byte at a time via a manual reader
@@ -301,7 +321,7 @@ mod tests {
     #[test]
     fn frame_roundtrip() {
         let f = Frame::data(42, 7, Bytes::from_static(b"hello"));
-        let encoded = f.encode();
+        let encoded = f.encode().unwrap();
         assert_eq!(encoded.len(), HEADER_LEN + 5);
 
         // Decode manually
@@ -314,6 +334,15 @@ mod tests {
         assert_eq!(flags, FLAG_DATA);
         assert_eq!(len, 5);
         assert_eq!(&encoded[15..], b"hello");
+    }
+
+    #[test]
+    fn encode_rejects_oversized_payload() {
+        // BUG-12: release builds must not silently truncate via `as u16`.
+        let f = Frame::data(1, 1, Bytes::from(vec![0u8; MAX_PAYLOAD + 1]));
+        assert!(f.encode().is_err());
+        let ok = Frame::data(1, 1, Bytes::from(vec![0u8; MAX_PAYLOAD]));
+        assert!(ok.encode().is_ok());
     }
 
     #[test]

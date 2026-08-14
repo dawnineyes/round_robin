@@ -108,9 +108,13 @@ pub fn find_config() -> Result<String> {
 
 // ── Port parsing ──────────────────────────────────────────────────────
 
+/// BUG-14: sanity cap on a single port range — a config typo like
+/// "1-65535" would otherwise spawn 65535 listeners at startup.
+const MAX_PORTS: usize = 256;
+
 pub fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
-    match ports {
-        Ports::List(v) => Ok(v.clone()),
+    let mut out = match ports {
+        Ports::List(v) => v.clone(),
         Ports::Range(s) => {
             if let Some((start, end)) = s.split_once('-') {
                 let start: u16 = start.trim().parse()?;
@@ -118,12 +122,33 @@ pub fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
                 if start > end {
                     bail!("port range: start > end");
                 }
-                Ok((start..=end).collect())
+                let count = end as usize - start as usize + 1;
+                if count > MAX_PORTS {
+                    bail!(
+                        "port range {start}-{end} has {count} ports, max {MAX_PORTS}"
+                    );
+                }
+                (start..=end).collect()
             } else {
-                Ok(vec![s.trim().parse()?])
+                vec![s.trim().parse()?]
             }
         }
+    };
+    // BUG-14: duplicate ports make the second listener fail its bind and
+    // silently die — dedup and warn instead of half-working configs.
+    let mut seen = std::collections::HashSet::new();
+    let before = out.len();
+    out.retain(|p| seen.insert(*p));
+    if out.len() != before {
+        tracing::warn!(
+            duplicates = before - out.len(),
+            "duplicate ports removed from configuration"
+        );
     }
+    if out.is_empty() {
+        bail!("no valid ports in configuration");
+    }
+    Ok(out)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -156,6 +181,19 @@ mod tests {
     #[test]
     fn parse_ports_invalid_range() {
         let ports = Ports::Range("52313-52311".into());
+        assert!(parse_ports(&ports).is_err());
+    }
+
+    #[test]
+    fn parse_ports_dedups_keeping_order() {
+        let ports = Ports::List(vec![52312, 52311, 52312, 52311, 52313]);
+        let result = parse_ports(&ports).unwrap();
+        assert_eq!(result, vec![52312, 52311, 52313]);
+    }
+
+    #[test]
+    fn parse_ports_rejects_huge_range() {
+        let ports = Ports::Range("1-65535".into());
         assert!(parse_ports(&ports).is_err());
     }
 }
