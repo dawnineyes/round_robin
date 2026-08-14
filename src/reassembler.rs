@@ -247,6 +247,18 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             let queue_depth = hb_pool.queue_depth();
             // Sweep dead links that accumulated from tunnel reconnects
             hb_pool.compact();
+            // B57: recycle links with no inbound traffic for
+            // LINK_IDLE_TIMEOUT — a silent TCP connection squatting a
+            // link slot must not permanently reject real tunnels
+            // (MAX_TUNNEL_LINKS is the only unbounded-exposure resource
+            // on the listener path).
+            let idle_swept = hb_pool.sweep_idle(
+                crate::tunnel::now_millis(),
+                crate::tunnel::LINK_IDLE_TIMEOUT,
+            );
+            if idle_swept > 0 {
+                warn!(count = idle_swept, "idle tunnel links recycled");
+            }
             // Sweep idle connections
             let now = Instant::now();
             hb_conns.retain(|&cid, vc| {
@@ -449,6 +461,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(crate::tunnel::now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -544,6 +557,10 @@ async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopC
         dispatch_frame(frame, &ctx).await?;
         ctx.link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         ctx.link.frames_recv.fetch_add(1, Ordering::Relaxed);
+        // B57: inbound activity stamps the link's liveness clock.
+        ctx.link
+            .last_recv_ms
+            .store(crate::tunnel::now_millis(), Ordering::Relaxed);
     }
 }
 
@@ -1739,6 +1756,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(crate::tunnel::now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });

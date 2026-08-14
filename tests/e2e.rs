@@ -515,6 +515,96 @@ async fn tunnel_death_resets_affected_connection_fast() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_disconnect_propagates_teardown() {
+    init_tracing();
+    tokio::time::timeout(Duration::from_secs(40), async {
+        let tports = reserve_ports(2).await;
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(run_socks5_proxy(proxy, Duration::ZERO));
+
+        // The observable: the target's connection must reach EOF
+        // promptly after the client disappears (the whole teardown
+        // chain: splitter read error/EOF → FIN → reassembler half-close
+        // → egress shutdown → target EOF — B48-B52/B57 paths).
+        let (report_tx, mut report_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let target_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match target_l.accept().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let tx = report_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    let _ = tx.send(()).await;
+                });
+            }
+        });
+
+        let splitter_port = reserve_ports(1).await[0];
+        let splitter_addr: SocketAddr = format!("127.0.0.1:{splitter_port}").parse().unwrap();
+
+        let reassembler_cfg = ReassemblerConfig {
+            listen_ip: "127.0.0.1".parse().unwrap(),
+            listen_ports: tports.clone(),
+            local_target: proxy_addr,
+            chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(60),
+        };
+        tokio::spawn(async move {
+            let _ = reassembler::run_reassembler(reassembler_cfg).await;
+        });
+
+        let splitter_cfg = SplitterConfig {
+            listen_addr: splitter_addr,
+            tunnels: tports
+                .iter()
+                .map(|p| TunnelEndpoint {
+                    proxy: proxy_addr,
+                    target: "127.0.0.1".into(),
+                    port: *p,
+                })
+                .collect(),
+            chunk_size: CHUNK,
+            data_send_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(60),
+        };
+        tokio::spawn(async move {
+            let _ = splitter::run_splitter(splitter_cfg).await;
+        });
+
+        let mut s = socks5_connect(splitter_addr, "127.0.0.1", target_addr.port())
+            .await
+            .unwrap();
+        // A couple of KB of traffic, then an abrupt disconnect (drop
+        // without shutdown — the splitter sees RST or EOF).
+        let chunk: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        s.write_all(&chunk).await.unwrap();
+        s.write_all(&chunk).await.unwrap();
+        drop(s);
+
+        // The target must see EOF within seconds, not after the 300s
+        // idle sweep.
+        tokio::time::timeout(Duration::from_secs(10), report_rx.recv())
+            .await
+            .expect("target never saw EOF after client disconnect")
+            .expect("target task died without reporting");
+    })
+    .await
+    .expect("client-disconnect teardown test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_keeps_sending_after_remote_fin() {
     init_tracing();
     tokio::time::timeout(Duration::from_secs(60), async {

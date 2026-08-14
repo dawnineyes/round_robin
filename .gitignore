@@ -2,3 +2,11 @@
 /backup
 *.exe
 config.toml
+
+# Per-round review/analysis working docs stay local only —
+# CHANGELOG.md is the permanent record, OPTIMIZATION_PLAN.md the live plan.
+/BUG_REVIEW*.md
+/OPTIMIZATION_PLAN_v*.md
+/REFACTOR*.md
+/ONLINE_ANALYSIS_REPORT.md
+/TEST_REPORT.md

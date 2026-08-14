@@ -13,6 +13,22 @@ pub const TUNNEL_CHANNEL_CAP: usize = 128;
 /// scheduling (Phase 14).  Larger = smoother but slower to react to a
 /// tunnel being rate-limited or recovering.
 const RATE_EWMA_TAU_SECS: f64 = 2.5;
+/// B57: a tunnel link with no inbound traffic for this long is recycled
+/// by the heartbeat.  Long enough that healthy-but-idle tunnels (a
+/// normal overnight stretch) rarely churn, short enough to bound the
+/// damage of silent TCP connections squatting link slots (the
+/// reassembler accepts raw TCP on its tunnel ports — 64 silent
+/// connections would otherwise permanently reject real tunnels).
+pub const LINK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Milliseconds since the Unix epoch — the clock for the link-idle
+/// sweep (atomic-friendly, comparable across tasks on one machine).
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 /// Per-link floor share of total weight: every live link is guaranteed
 /// this fraction of picks regardless of its measured rate, so a
 /// throttled-but-alive tunnel can never be starved into congestion-
@@ -39,6 +55,10 @@ pub struct TunnelLink {
     /// stack's RTO gives up (minutes), delaying the reconnect — the
     /// drain's own write-stall timeout (60s) now bounds it.
     pub writer_died: Arc<Notify>,
+    /// B57: last inbound frame time (ms since epoch, `now_millis()`).
+    /// Updated by the read loop; the heartbeat's `sweep_idle` recycles
+    /// links that stayed silent for `LINK_IDLE_TIMEOUT`.
+    pub last_recv_ms: AtomicU64,
     /// Frames that were queued but never written when the link died.
     pub lost_frames: Mutex<Vec<Frame>>,
     /// EWMA of drain throughput in bytes/sec (f64 bits).  Written only by
@@ -107,6 +127,30 @@ impl TunnelPool {
         if links.len() != before {
             self.rr.store(0, Ordering::Release);
         }
+    }
+
+    /// B57: recycle live links that saw no inbound traffic for
+    /// `idle_limit`.  A silent TCP connection otherwise squats a link
+    /// slot forever (the reader task blocked in read, the writer idle) —
+    /// MAX_TUNNEL_LINKS of them would permanently reject real tunnels.
+    /// Marking the link dead + firing `stop` tears it down through the
+    /// existing chain: drain exits → `writer_died` → read loop exits →
+    /// the owner reconnects (splitter) or frees the slot (reassembler).
+    /// Returns the number of links recycled.
+    pub fn sweep_idle(&self, now_ms: u64, idle_limit: std::time::Duration) -> usize {
+        let idle_limit_ms = idle_limit.as_millis() as u64;
+        let links = self.links.lock().unwrap();
+        let mut swept = 0;
+        for l in links.iter() {
+            if l.alive.load(Ordering::Acquire)
+                && now_ms.saturating_sub(l.last_recv_ms.load(Ordering::Relaxed)) > idle_limit_ms
+            {
+                l.alive.store(false, Ordering::Release);
+                l.stop.notify_one();
+                swept += 1;
+            }
+        }
+        swept
     }
 
     /// Return (alive_count, total_count) for monitoring / heartbeat.
@@ -431,6 +475,7 @@ mod tests {
                 frames_recv: AtomicU64::new(0),
                 stop: Arc::new(Notify::new()),
                 writer_died: Arc::new(Notify::new()),
+                last_recv_ms: AtomicU64::new(now_millis()),
                 lost_frames: Mutex::new(Vec::new()),
                 rate_bps: AtomicU64::new(0),
             })
@@ -458,6 +503,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -542,6 +588,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -576,6 +623,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -587,6 +635,35 @@ mod tests {
             .unwrap();
         assert!(link.lost_frames.lock().unwrap().is_empty());
         drop(peer);
+    }
+
+    /// B57 regression: a live link with no inbound traffic for the idle
+    /// limit is recycled — marked dead + stop fired, so the owner's
+    /// teardown chain (drain → writer_died → read loop) reclaims the
+    /// slot.  Silent TCP connections must not squat slots forever.
+    #[tokio::test]
+    async fn sweep_idle_recycles_silent_links() {
+        let pool = TunnelPool::new();
+        let (tx1, _rx1) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let (tx2, _rx2) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let fresh = mk_link(tx1, 0.0);
+        let stale = mk_link(tx2, 0.0);
+        stale
+            .last_recv_ms
+            .store(now_millis() - 601_000, Ordering::Relaxed);
+        pool.add(fresh.clone());
+        pool.add(stale.clone());
+        // The stop signal must fire for the swept link.
+        let notified = stale.stop.notified();
+        let swept = pool.sweep_idle(now_millis(), LINK_IDLE_TIMEOUT);
+        assert_eq!(swept, 1);
+        assert!(!stale.alive.load(Ordering::Acquire));
+        assert!(fresh.alive.load(Ordering::Acquire));
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("swept link's stop must be notified");
+        // A fresh clock means "just active" — never swept.
+        assert_eq!(pool.sweep_idle(now_millis(), LINK_IDLE_TIMEOUT), 0);
     }
 
     #[tokio::test]
@@ -602,6 +679,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(0),
         });
@@ -624,6 +702,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             writer_died: Arc::new(Notify::new()),
+            last_recv_ms: AtomicU64::new(now_millis()),
             lost_frames: Mutex::new(Vec::new()),
             rate_bps: AtomicU64::new(rate.to_bits()),
         })

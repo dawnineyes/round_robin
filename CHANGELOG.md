@@ -6,6 +6,35 @@
 
 ---
 
+## Phase 18: 第七轮 Bug 审查修复（v1.10.13）
+
+> **基线**: v1.10.12
+> **来源**: 第七轮审查（B57，报告留本地，见 .gitignore 约定）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/tunnel.rs` | `TunnelLink` 增加 `last_recv_ms: AtomicU64`（读循环逐帧盖章，`now_millis()` 时钟）；`TunnelPool::sweep_idle(now_ms, idle_limit)` 回收静默超过 `LINK_IDLE_TIMEOUT`(600s) 的活链路（置 dead + 触发 `stop`，经既有链条 drain→writer_died→读循环拆除）；新增 1 个单测 | B57 |
+| `src/splitter.rs` | 读循环逐帧更新 `last_recv_ms`；心跳在 compact 后调用 `sweep_idle`（回收数 warn 日志）；测试构造点补字段 | B57 |
+| `src/reassembler.rs` | 同上（读循环 + 心跳清扫 + 构造点） | B57 |
+| `tests/e2e.rs` | 新增 `client_disconnect_propagates_teardown`：客户端写 8KB 后直接断开（drop 不 shutdown），断言目标端在 10s 内看到 EOF（覆盖拆分拆除链 B48–B52 的端到端路径） | 测试覆盖 |
+| `Cargo.toml` | 版本 1.10.12 → 1.10.13 | 发布 |
+
+### 行为变化
+
+- **B57 修复**: 隧道链路（监听路径上唯一没有显式上界的资源）获得空闲回收——静默 TCP 连接不再永久占用链路槽位（此前 64 条即可永久拒绝真实隧道，MAX_TUNNEL_LINKS）；对端静默卡死的隧道在 600s 无入站流量后自动回收重建。健康空闲隧道（如夜间零流量）最长每 600s 重建一次（3s 重连，无流量损失）
+- **测试覆盖**: 新增 e2e 覆盖客户端中途断开 → 目标端及时 EOF 的完整拆除链（此前该路径只有单元测试）
+
+### 测试结果
+
+- `cargo test`: 56/56 单元测试（新增 `sweep_idle_recycles_silent_links`）+ 5/5 e2e 集成测试通过（新增 `client_disconnect_propagates_teardown`）
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 17: 第六轮 Bug 审查修复 + 优化（v1.10.12）
 
 > **基线**: v1.10.11

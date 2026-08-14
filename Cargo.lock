@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "round_robin"
-version = "1.10.12"
+version = "1.10.13"
 dependencies = [
  "anyhow",
  "bytes",
