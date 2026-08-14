@@ -13,8 +13,7 @@ async fn main() -> Result<()> {
     let cfg: round_robin::config::Config = toml::from_str(&content)?;
 
     // File logging: daily rotation, no ANSI, compact format
-    let log_dir =
-        round_robin::config::exe_dir().unwrap_or_else(|| PathBuf::from("."));
+    let log_dir = round_robin::config::exe_dir().unwrap_or_else(|| PathBuf::from("."));
     if cfg.log {
         let writer = logging::DailyLogWriter::new(log_dir.clone(), "round_robin", 7)
             .expect("failed to create log writer");
@@ -87,6 +86,7 @@ async fn main() -> Result<()> {
                 listen_addr: sc.listen,
                 tunnels,
                 chunk_size: sc.chunk_size,
+                heartbeat_interval: std::time::Duration::from_secs(60),
             })
             .await
         }

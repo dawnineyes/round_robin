@@ -21,9 +21,6 @@ pub const MAX_PAYLOAD: usize = 65535;
 pub const MIN_CHUNK: usize = 512;
 pub const MAX_CHUNK: usize = 65535;
 
-/// Reserved conn_id for legacy UDP relay traffic (single-client mode).
-/// v1.10.5+ allocates a real conn_id per UDP association instead.
-pub const UDP_CONN_ID: u32 = 0;
 /// Max out-of-order entries before new arrivals are dropped.
 pub const MAX_REORDER_WINDOW: usize = 512;
 /// BUG-8 fix: byte budget for the reorder window, independent of frame
@@ -125,14 +122,19 @@ pub struct SynTarget {
 }
 
 impl SynTarget {
-    pub fn encode(&self) -> Bytes {
+    /// B30: returns an error instead of truncating addresses that exceed
+    /// the u16 length field (truncation would corrupt the SYN payload).
+    pub fn encode(&self) -> Result<Bytes> {
         let addr = self.address.as_bytes();
+        if addr.len() > u16::MAX as usize {
+            bail!("SYN address too long: {} bytes", addr.len());
+        }
         let mut buf = BytesMut::with_capacity(1 + 2 + addr.len() + 2);
         buf.put_u8(self.proto);
         buf.put_u16(addr.len() as u16);
         buf.put_slice(addr);
         buf.put_u16(self.port);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self> {
@@ -292,7 +294,8 @@ mod tests {
                 address: "example.com".into(),
                 port: 443,
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         );
         let encoded = f.encode().unwrap();
         let mut decoder = FrameDecoder::new();
@@ -352,7 +355,7 @@ mod tests {
             address: "example.com".into(),
             port: 443,
         };
-        let encoded = t.encode();
+        let encoded = t.encode().unwrap();
         let decoded = SynTarget::decode(&encoded).unwrap();
         assert_eq!(decoded.proto, PROTO_TCP);
         assert_eq!(decoded.address, "example.com");

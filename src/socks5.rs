@@ -48,8 +48,11 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result>
         bail!("not SOCKS5 (version {})", hdr[0]);
     }
     let nmethods = hdr[1] as usize;
-    if nmethods == 0 || nmethods > 16 {
-        bail!("invalid nmethods: {nmethods}");
+    // B31: RFC 1928 allows up to 255 methods (nmethods is u8, so the
+    // 255 cap is inherent) — the old >16 rejection broke clients that
+    // advertise a long method list.
+    if nmethods == 0 {
+        bail!("invalid nmethods: 0");
     }
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;

@@ -48,7 +48,8 @@ async fn proxy_conn(mut s: TcpStream, connect_delay: Duration) -> std::io::Resul
     let mut req = [0u8; 4];
     s.read_exact(&mut req).await?;
     if req[1] != 0x01 {
-        s.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        s.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         return Ok(());
     }
     let (host, port) = read_socks_addr(&mut s, req[3]).await?;
@@ -154,11 +155,7 @@ async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> std::io::Re
     }
 }
 
-async fn socks5_handshake(
-    proxy: SocketAddr,
-    host: &str,
-    port: u16,
-) -> std::io::Result<TcpStream> {
+async fn socks5_handshake(proxy: SocketAddr, host: &str, port: u16) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(proxy).await?;
     s.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut resp = [0u8; 2];
@@ -205,11 +202,7 @@ async fn socks5_handshake(
 
 /// UDP ASSOCIATE with retry, then send one datagram; returns the
 /// response payload.
-async fn udp_associate_exchange(
-    proxy: SocketAddr,
-    target: SocketAddr,
-    payload: &[u8],
-) -> Vec<u8> {
+async fn udp_associate_exchange(proxy: SocketAddr, target: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let (ctrl, relay) = loop {
         match udp_associate(proxy).await {
@@ -352,10 +345,7 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
         let slow_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let slow_proxy_addr = slow_proxy.local_addr().unwrap();
         tokio::spawn(run_socks5_proxy(fast_proxy, Duration::ZERO));
-        tokio::spawn(run_socks5_proxy(
-            slow_proxy,
-            Duration::from_millis(400),
-        ));
+        tokio::spawn(run_socks5_proxy(slow_proxy, Duration::from_millis(400)));
         // echo target
         let target_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_l.local_addr().unwrap();
@@ -398,6 +388,7 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
                 },
             ],
             chunk_size: CHUNK,
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -408,9 +399,7 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
         let mut s = socks5_connect(splitter_addr, "127.0.0.1", target_addr.port())
             .await
             .unwrap();
-        let request: Vec<u8> = (0..CHUNK * 16)
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let request: Vec<u8> = (0..CHUNK * 16).map(|i| (i % 251) as u8).collect();
         s.write_all(&request).await.unwrap();
         s.shutdown().await.unwrap();
 
@@ -482,6 +471,7 @@ async fn tunnel_death_resets_affected_connection_fast() {
                 },
             ],
             chunk_size: CHUNK,
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -595,6 +585,10 @@ async fn client_keeps_sending_after_remote_fin() {
                 })
                 .collect(),
             chunk_size: CHUNK,
+            // B21 regression: 2s heartbeat so the sweep would fire while
+            // the client is still sending — pre-fix, the first sweep
+            // after the FIN killed the conn and truncated the tail.
+            heartbeat_interval: Duration::from_secs(2),
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -610,9 +604,15 @@ async fn client_keeps_sending_after_remote_fin() {
         s.read_exact(&mut part1).await.unwrap();
         assert_eq!(&part1[..], b"PART1:hello");
         // Give the FIN time to propagate to the splitter, then keep
-        // sending — pre-D3 code drops this data.
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        s.write_all(b"world").await.unwrap();
+        // sending ACROSS MULTIPLE heartbeat cycles (B21 regression:
+        // pre-fix, the first heartbeat after the FIN swept the conn and
+        // truncated this tail; heartbeat_interval here is 2s).
+        let mut expected_tail = Vec::new();
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            s.write_all(b"world").await.unwrap();
+            expected_tail.extend_from_slice(b"world");
+        }
         s.shutdown().await.unwrap();
         let mut buf = vec![0u8; 65536];
         loop {
@@ -626,7 +626,11 @@ async fn client_keeps_sending_after_remote_fin() {
             .await
             .expect("target never reported its received tail")
             .expect("target task died without reporting");
-        assert_eq!(&tail[..], b"world", "client data after remote FIN was lost");
+        assert_eq!(
+            &tail[..],
+            &expected_tail[..],
+            "client data after remote FIN was lost (B21 sweep?)"
+        );
     })
     .await
     .expect("D3 half-close test timed out");
@@ -670,6 +674,7 @@ async fn udp_e2e_two_clients_relay_concurrently() {
                 })
                 .collect(),
             chunk_size: CHUNK,
+            heartbeat_interval: Duration::from_secs(60),
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;

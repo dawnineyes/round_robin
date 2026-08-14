@@ -6,6 +6,48 @@
 
 ---
 
+## Phase 12: 第二轮 Bug 审查修复（v1.10.7）
+
+> **基线**: v1.10.6
+> **来源**: `BUG_REVIEW_v1106.md`（B21–B32）+ `OPTIMIZATION_PLAN_v1106.md` P0/P1
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/splitter.rs` | 心跳 FIN 清扫判定改为"完整 + 30s 静默"（纯函数 `fin_sweep_decision` + 单测）；心跳周期可配置（`SplitterConfig.heartbeat_interval`）；清扫路径写 TIME_WAIT 墓碑；拆除路径改 `remove_if + Arc::ptr_eq`；close grace 循环感知 RST；重连退避可中断（1s 粒度检查 shutdown）；连接上限改 Notify 唤醒；UDP 中继补 bytes/frames 统计；UDP keepalive 仅 EOF 结束；移除 conn 0 分支与 `_tunnel_idx` | B21/B25/B26/B28/B29/B31/B32 |
+| `src/reassembler.rs` | 隧道读循环结束补 `link.stop.notify_one()`；pending 丢弃 DATA/FIN 一律失败快（`fail_pending_conn`：取消 + 墓碑 + RST，含单测）；RST 分支不再种幽灵条目、SYN 路径复核 closed 墓碑；pending 字节预算改 CAS 原子预留；SYN proto 校验（未知 proto 回 RST）；handshaking 带时间戳 + 120s TTL 清扫；UDP 响应补统计并刷新活跃时间；删除 conn 0 遗留中继（全局 UdpPair + 常驻任务） | B22/B23/B27/B28/B29/B30/B32 |
+| `src/tunnel.rs` | `drain_frames` 泛型化（可注入测试 writer）；stop 竞速与 encode 失败时在途帧记入 `lost_frames`；新增 stop 退出/丢帧上报两个单测 | B24 |
+| `src/frame.rs` | 删除 `UDP_CONN_ID`；`SynTarget::encode` 返回 `Result`（地址超长报错而非 `as u16` 截断） | B28/B30 |
+| `src/socks5.rs` | nmethods 上限放宽到 255（u8 天然上限） | B31 |
+| `src/main.rs` | SplitterConfig 传 `heartbeat_interval = 60s` | B21 |
+| `tests/e2e.rs` | 全部 SplitterConfig 显式心跳周期；D3 测试改为 2s 心跳 + FIN 后跨多个心跳持续发送 6 段数据（B21 回归） | 回归 |
+| `Cargo.toml` | 版本 1.10.6 → 1.10.7 | 发布 |
+
+### 行为变化
+
+- **B21 修复**: 远端 FIN 且响应流完整后，连接仅在 30s 无活动时才被心跳回收——客户端在 FIN 后持续上传（D3 半关闭）不再被中途切断（旧逻辑在下一次心跳就无条件清扫）
+- **B22 修复**: reassembler 隧道死亡不再永久泄漏 drain 任务 + socket（补 stop 通知，与 splitter 对齐）
+- **B23 修复**: pending 缓冲丢弃 DATA/FIN 立即 RST 失败快，不再产生 seq 空洞导致数分钟停摆与目标端静默截断
+- **B24 修复**: 隧道死亡时在途帧计入 `lost_frames`，D1 快恢复不再漏掉恰好 1 帧
+- **B25 修复**: 心跳清扫先写 TIME_WAIT、拆除用 `remove_if + ptr_eq`，封死 conn_id 复用竞态窗口
+- **B26 修复**: RST 后 close grace 循环立即退出，不再空等最多 60s
+- **B27 修复**: RST 不再产生幽灵 pending 条目；SYN 路径复核 closed 墓碑
+- **B28 清理**: 删除 conn 0 遗留单客户端 UDP 中继（每关联独立 conn_id 已是唯一路径）
+- **B29 补齐**: UDP 双向统计、handshaking 120s TTL 清扫
+- **B30 加固**: SYN 地址超长报错、未知 proto 回 RST
+- **B31 兼容**: nmethods ≤255；UDP 关联随 keepalive TCP EOF 结束而非任意字节
+- **B32 细节**: 可中断退避、连接上限 Notify 唤醒、pending 预算 CAS 原子预留
+
+### 测试结果
+
+- `cargo test`: 27/27 单元测试 + 4/4 e2e 集成测试通过
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --release`: 见发布流程
+
+---
+
 ## Phase 11: 快恢复 + 半关闭语义 + 性能（v1.10.6）
 
 > **基线**: v1.10.5  

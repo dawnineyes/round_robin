@@ -167,11 +167,10 @@ impl Default for TunnelPool {
 /// channel closes and senders fail over to other tunnels.
 const TUNNEL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub async fn drain_frames(
-    mut rx: mpsc::Receiver<Frame>,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
-    link: Arc<TunnelLink>,
-) {
+pub async fn drain_frames<W>(mut rx: mpsc::Receiver<Frame>, mut wr: W, link: Arc<TunnelLink>)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     // O2: one reusable encode buffer per tunnel (no per-frame alloc).
     let mut enc = BytesMut::with_capacity(15 + MAX_PAYLOAD);
     let mut dead = false;
@@ -186,11 +185,21 @@ pub async fn drain_frames(
                 // truncating and corrupting the byte stream.
                 if let Err(e) = frame.encode_into(&mut enc) {
                     tracing::warn!(error = %e, conn_id = frame.conn_id, "encode failed, dropping frame");
+                    // B24: report it as lost so D1 recovery can reset the
+                    // affected connection instead of stalling it.
+                    link.lost_frames.lock().unwrap().push(frame);
                     dead = true;
                     continue;
                 }
                 tokio::select! {
-                    _ = link.stop.notified() => dead = true,
+                    _ = link.stop.notified() => {
+                        // B24: the frame was dequeued but not written —
+                        // report it as lost instead of dropping it
+                        // silently (the old code let D1 recovery miss
+                        // exactly this in-flight frame).
+                        link.lost_frames.lock().unwrap().push(frame);
+                        dead = true;
+                    }
                     r = tokio::time::timeout(TUNNEL_WRITE_TIMEOUT, wr.write_all(&enc)) => {
                         match r {
                             Ok(Ok(())) => {
@@ -266,6 +275,69 @@ mod tests {
         pool.add(link);
         drop(rx); // receiver gone → channel closed
         assert!(!pool.send_async(Frame::rst(1)).await);
+    }
+
+    // B22/B24 regression: stop must make drain_frames exit promptly and
+    // report the in-flight frame as lost (covers both the still-queued
+    // path and the dequeued-but-stalled write path).
+    #[tokio::test]
+    async fn stop_exits_and_reports_lost_frames() {
+        // duplex capacity 1024 per direction: a frame larger than the
+        // buffer makes the drain task's write stall (nobody reads the
+        // peer end), which forces the in-flight select path.
+        let (peer, wr) = tokio::io::duplex(1024);
+
+        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let link = Arc::new(TunnelLink {
+            tx,
+            alive: AtomicBool::new(true),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
+            stop: Arc::new(Notify::new()),
+            lost_frames: Mutex::new(Vec::new()),
+        });
+        let f = Frame::data(7, 3, bytes::Bytes::from(vec![0u8; 8192]));
+        link.tx.send(f.clone()).await.unwrap();
+        let task = tokio::spawn(drain_frames(rx, wr, link.clone()));
+        // Give the drain task a chance to dequeue the frame and stall on
+        // the full duplex buffer, then stop it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        link.stop.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("drain_frames did not exit after stop")
+            .unwrap();
+        let lost = link.lost_frames.lock().unwrap().clone();
+        assert_eq!(lost.len(), 1, "in-flight frame must be reported as lost");
+        assert_eq!(lost[0].conn_id, 7);
+        assert_eq!(lost[0].seq, 3);
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn stop_exits_with_empty_queue() {
+        let (peer, wr) = tokio::io::duplex(1024);
+        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let link = Arc::new(TunnelLink {
+            tx,
+            alive: AtomicBool::new(true),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
+            stop: Arc::new(Notify::new()),
+            lost_frames: Mutex::new(Vec::new()),
+        });
+        let task = tokio::spawn(drain_frames(rx, wr, link.clone()));
+        link.stop.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("drain_frames did not exit after stop")
+            .unwrap();
+        assert!(link.lost_frames.lock().unwrap().is_empty());
+        drop(peer);
     }
 
     #[tokio::test]

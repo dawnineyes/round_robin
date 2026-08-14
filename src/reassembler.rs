@@ -1,6 +1,6 @@
 use crate::frame::{
-    FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, MAX_PENDING_BYTES, MAX_PENDING_CIDS, PROTO_UDP,
-    Frame, FrameDecoder, MAX_PAYLOAD, SynTarget, UDP_CONN_ID,
+    FLAG_DATA, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, MAX_PAYLOAD, MAX_PENDING_BYTES,
+    MAX_PENDING_CIDS, PROTO_TCP, PROTO_UDP, SynTarget,
 };
 use crate::reorder::ReorderBuf;
 use crate::shutdown_signal;
@@ -10,7 +10,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,6 +45,9 @@ const HALF_CLOSE_FALLBACK: Duration = Duration::from_secs(10);
 const CLOSED_TTL: Duration = Duration::from_secs(60);
 /// Cap tunnel links per reassembler to bound per-link task/memory usage.
 const MAX_TUNNEL_LINKS: usize = 64;
+/// B29: handshaking flags outlive any possible SYN handshake (egress
+/// connect timeout is 10s) — sweep entries older than this.
+const HANDSHAKING_TTL: Duration = Duration::from_secs(120);
 
 // ── Egress connection ─────────────────────────────────────────────────
 
@@ -140,82 +143,15 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let conns: ConnMap = Arc::new(DashMap::new());
     let pending: PendingMap = Arc::new(DashMap::new());
     let closed: Arc<DashMap<u32, Instant>> = Arc::new(DashMap::new());
-    let handshaking: Arc<DashMap<u32, ()>> = Arc::new(DashMap::new());
+    let handshaking: Arc<DashMap<u32, Instant>> = Arc::new(DashMap::new());
     let pool = Arc::new(TunnelPool::new());
     // BUG-7: global byte budget for DATA-before-SYN buffering.
     let pending_bytes: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     // Connection reset counter (observability: logged by the heartbeat).
     let resets: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    // Global UDP socket pair for the LEGACY single-client relay (conn 0).
-    // BUG-18: v4 + optional v6, so IPv6 targets work too.
-    let udp_pair = Arc::new(bind_udp_pair().await?);
-    info!(
-        v4 = %udp_pair.v4.local_addr()?,
-        v6 = udp_pair.v6.as_ref().map(|s| s.local_addr()).transpose()?.map(|a| a.to_string()).unwrap_or_default(),
-        "UDP relay ready"
-    );
-
-    // Background: read UDP responses from targets → DATA frames → pool
-    {
-        let udp = udp_pair.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut buf4 = vec![0u8; 65535];
-            let mut buf6 = vec![0u8; 65535];
-            let mut udp_seq: u64 = 1;
-            loop {
-                let (n, src) = tokio::select! {
-                    r = udp.v4.recv_from(&mut buf4) => match r { Ok(v) => v, Err(e) => {
-                        warn!(error = %e, "UDP relay recv error (v4)");
-                        break;
-                    }},
-                    r = async {
-                        match &udp.v6 {
-                            Some(s) => s.recv_from(&mut buf6).await,
-                            None => std::future::pending().await,
-                        }
-                    } => match r { Ok(v) => v, Err(e) => {
-                        warn!(error = %e, "UDP relay recv error (v6)");
-                        break;
-                    }},
-                };
-                // Wrap in SOCKS5 UDP response header
-                let src_target = socks5::TargetAddr {
-                    address: normalize_ip(src.ip()),
-                    port: src.port(),
-                };
-                let payload = if src.is_ipv4() { &buf4[..n] } else { &buf6[..n] };
-                let dgram = match socks5::encode_udp_datagram(&src_target, payload) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(error = %e, "UDP encode failed");
-                        continue;
-                    }
-                };
-                // A wrapped max-size IPv6 datagram can exceed the
-                // u16 frame length field — drop instead of
-                // truncating and corrupting the stream.
-                if dgram.len() > MAX_PAYLOAD {
-                    warn!(
-                        len = dgram.len(),
-                        "UDP datagram exceeds frame capacity, dropping"
-                    );
-                    continue;
-                }
-                // BUG-3: only consume the seq when the frame is actually
-                // handed to a tunnel — a dropped response used to leave a
-                // permanent gap in the splitter's reorder buffer and
-                // eventually kill the relay.
-                let frame = Frame::data(UDP_CONN_ID, udp_seq, dgram);
-                if pool.send(frame) {
-                    udp_seq = udp_seq.wrapping_add(1);
-                } else {
-                    warn!("UDP relay: no live tunnels, dropping response datagram");
-                }
-            }
-        });
-    }
+    // B28: the legacy conn-0 single-client UDP relay was removed — every
+    // UDP association gets its own conn_id + socket pair (BUG-19 design).
 
     // Spawn a listener for each port
     for &port in &cfg.listen_ports {
@@ -226,7 +162,6 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let pool = pool.clone();
         let local_target = cfg.local_target;
         let listen_ip = cfg.listen_ip;
-        let udp = udp_pair.clone();
         let pending_bytes = pending_bytes.clone();
         let resets = resets.clone();
         let lctx = ListenerCtx {
@@ -238,7 +173,6 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             handshaking,
             pool,
             chunk_size: cfg.chunk_size,
-            udp_sock: udp,
             pending_bytes,
             resets,
         };
@@ -259,6 +193,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let hb_closed = closed.clone();
     let hb_pending_bytes = pending_bytes.clone();
     let hb_resets = resets.clone();
+    let hb_handshaking = handshaking.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -287,6 +222,16 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             });
             // Sweep closed-cid tombstones
             hb_closed.retain(|_, since| now.duration_since(*since) < CLOSED_TTL);
+            // B29: sweep handshaking flags that outlived any possible
+            // SYN handshake (only leaked by panic/bind-failure paths).
+            let handshaking_before = hb_handshaking.len();
+            hb_handshaking.retain(|_, since| now.duration_since(*since) < HANDSHAKING_TTL);
+            if hb_handshaking.len() != handshaking_before {
+                warn!(
+                    swept = handshaking_before - hb_handshaking.len(),
+                    "stale SYN handshakes swept"
+                );
+            }
             // Sweep stale pending entries that never got a SYN, refunding
             // their byte budget (BUG-7).
             let mut freed = 0usize;
@@ -307,6 +252,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                 active_conns = hb_conns.len(),
                 pending_cids = hb_pending.len(),
                 pending_bytes = hb_pending_bytes.load(Ordering::Relaxed),
+                handshaking = hb_handshaking.len(),
                 resets = hb_resets.swap(0, Ordering::Relaxed),
                 "heartbeat"
             );
@@ -361,9 +307,10 @@ impl UdpPair {
                 // Domain name: resolve (UDP datagram targets are almost
                 // always IP literals, but keep domain support).
                 let addrs = tokio::net::lookup_host((host, port)).await?;
-                addrs.map(|a| a.ip()).next().ok_or_else(|| {
-                    anyhow::anyhow!("UDP target resolved to no address: {host}")
-                })?
+                addrs
+                    .map(|a| a.ip())
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("UDP target resolved to no address: {host}"))?
             }
         };
         let addr = SocketAddr::new(ip, port);
@@ -389,10 +336,9 @@ struct ListenerCtx {
     conns: ConnMap,
     pending: PendingMap,
     closed: Arc<DashMap<u32, Instant>>,
-    handshaking: Arc<DashMap<u32, ()>>,
+    handshaking: Arc<DashMap<u32, Instant>>,
     pool: Arc<TunnelPool>,
     chunk_size: usize,
-    udp_sock: Arc<UdpPair>,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
 }
@@ -469,7 +415,6 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             pool: ctx.pool.clone(),
             local_target: ctx.local_target,
             chunk_size: ctx.chunk_size,
-            udp_sock: ctx.udp_sock.clone(),
             pending_bytes: ctx.pending_bytes.clone(),
             resets: ctx.resets.clone(),
             link: link.clone(),
@@ -479,6 +424,10 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
                 warn!(tunnel = port, error = %e, "read loop ended");
             }
             link.alive.store(false, Ordering::Release);
+            // B22: wake the drain task — without this it can only exit
+            // when every Sender is dropped, and it holds the last Arc
+            // itself → permanent task + socket leak per dead tunnel.
+            link.stop.notify_one();
             info!(
                 tunnel = port,
                 bytes_sent = link.bytes_sent.load(Ordering::Relaxed),
@@ -495,11 +444,10 @@ struct ReadLoopCtx {
     conns: ConnMap,
     pending: PendingMap,
     closed: Arc<DashMap<u32, Instant>>,
-    handshaking: Arc<DashMap<u32, ()>>,
+    handshaking: Arc<DashMap<u32, Instant>>,
     pool: Arc<TunnelPool>,
     local_target: SocketAddr,
     chunk_size: usize,
-    udp_sock: Arc<UdpPair>,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
     link: Arc<TunnelLink>,
@@ -524,16 +472,6 @@ async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopC
 async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
     let cid = frame.conn_id;
 
-    // UDP relay: conn_id 0, DATA → send to target
-    if cid == UDP_CONN_ID && frame.flags & FLAG_DATA != 0 {
-        handle_udp_frame(frame, &ctx.udp_sock).await;
-        return Ok(());
-    }
-    // Ignore any non-DATA frames for UDP_CONN_ID (SYN/FIN/RST not applicable)
-    if cid == UDP_CONN_ID {
-        return Ok(());
-    }
-
     // SYN: new virtual connection
     if frame.flags & FLAG_SYN != 0 {
         // Duplicate SYN on an established connection — nothing to do.
@@ -547,7 +485,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         // One SYN handshake per cid at a time; a duplicate SYN racing on
         // a different tunnel would otherwise spawn a second egress
         // connection and overwrite the conn entry.
-        if ctx.handshaking.insert(cid, ()).is_some() {
+        if ctx.handshaking.insert(cid, Instant::now()).is_some() {
             warn!(conn_id = cid, "duplicate SYN while handshaking, ignoring");
             return Ok(());
         }
@@ -561,6 +499,15 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             let mut entry = ctx.pending.entry(cid).or_insert_with(PendingEntry::new);
             entry.cancel = Some(hshake_cancel.clone());
         }
+        // B27/B23: an RST (or a pending-drop fail-fast) may have
+        // tombstoned this cid while the SYN was in flight — don't build
+        // an egress connection for a conn the splitter already reset.
+        if ctx.closed.contains_key(&cid) {
+            warn!(conn_id = cid, "SYN for closed cid, ignoring");
+            remove_pending(ctx, &cid);
+            ctx.handshaking.remove(&cid);
+            return Ok(());
+        }
 
         // Parse target from SYN payload
         let syn_target = match SynTarget::decode(&frame.payload) {
@@ -569,19 +516,27 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 warn!(conn_id = cid, error = %e, "SYN decode failed");
                 remove_pending(ctx, &cid);
                 ctx.handshaking.remove(&cid);
+                // Tombstone so late DATA gets RST instead of a zombie
+                // pending entry.
+                ctx.closed.insert(cid, Instant::now());
                 ctx.pool.send(Frame::rst(cid));
                 return Ok(());
             }
         };
         info!(conn_id = cid, target = %syn_target.address, proto = syn_target.proto, "SYN");
 
-        // BUG-4: an RST may have arrived while this SYN was in flight —
-        // don't build a connection nobody wants.
-        if ctx.pending.get(&cid).map(|e| e.cancelled).unwrap_or(false) {
-            warn!(conn_id = cid, "SYN cancelled by RST before handshake");
+        // B30: only TCP and UDP are meaningful protos — reject anything
+        // else instead of silently treating it as TCP.
+        if syn_target.proto != PROTO_TCP && syn_target.proto != PROTO_UDP {
+            warn!(
+                conn_id = cid,
+                proto = syn_target.proto,
+                "unknown SYN proto, resetting"
+            );
             remove_pending(ctx, &cid);
             ctx.handshaking.remove(&cid);
             ctx.closed.insert(cid, Instant::now());
+            ctx.pool.send(Frame::rst(cid));
             return Ok(());
         }
 
@@ -621,6 +576,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             let cancel_r = cancel.clone();
             let pool_r = ctx.pool.clone();
             let udp_r = udp_sock.clone();
+            let conns_r = ctx.conns.clone();
             tokio::spawn(async move {
                 let mut buf4 = vec![0u8; 65535];
                 let mut buf6 = vec![0u8; 65535];
@@ -652,7 +608,11 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                         address: normalize_ip(src.ip()),
                         port: src.port(),
                     };
-                    let payload = if src.is_ipv4() { &buf4[..n] } else { &buf6[..n] };
+                    let payload = if src.is_ipv4() {
+                        &buf4[..n]
+                    } else {
+                        &buf6[..n]
+                    };
                     let dgram = match socks5::encode_udp_datagram(&src_target, payload) {
                         Ok(d) => d,
                         Err(e) => {
@@ -661,14 +621,29 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                         }
                     };
                     if dgram.len() > MAX_PAYLOAD {
-                        warn!(conn_id = cid, len = dgram.len(), "UDP datagram exceeds frame capacity, dropping");
+                        warn!(
+                            conn_id = cid,
+                            len = dgram.len(),
+                            "UDP datagram exceeds frame capacity, dropping"
+                        );
                         continue;
                     }
+                    let dgram_len = dgram.len() as u64;
                     let frame = Frame::data(cid, seq, dgram);
                     if pool_r.send(frame) {
                         seq = seq.wrapping_add(1);
+                        // B29: count responses and refresh activity so a
+                        // busy relay isn't idle-swept mid-flight.
+                        if let Some(vc) = conns_r.get(&cid) {
+                            vc.bytes_sent.fetch_add(dgram_len, Ordering::Relaxed);
+                            vc.frames_sent.fetch_add(1, Ordering::Relaxed);
+                            *vc.last_active.lock().unwrap() = Instant::now();
+                        }
                     } else {
-                        warn!(conn_id = cid, "UDP relay: no live tunnels, dropping response datagram");
+                        warn!(
+                            conn_id = cid,
+                            "UDP relay: no live tunnels, dropping response datagram"
+                        );
                     }
                 }
             });
@@ -833,7 +808,9 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 // BUG-19: UDP relay conn — forward the datagram directly
                 // through the conn's own socket (no ordering, no routes).
                 forward_udp_datagram(&vconn, &frame.payload).await;
-                vconn.bytes_recv.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+                vconn
+                    .bytes_recv
+                    .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
                 vconn.frames_recv.fetch_add(1, Ordering::Relaxed);
                 *vconn.last_active.lock().unwrap() = Instant::now();
                 return Ok(());
@@ -910,7 +887,13 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         if ctx.pending.contains_key(&cid) {
             // BUG-7: budget the frame before touching the entry.
             if !try_reserve_pending(ctx, Some(cid), plen) {
-                warn!(conn_id = cid, "pending byte budget exhausted, dropping DATA");
+                warn!(
+                    conn_id = cid,
+                    "pending byte budget exhausted, resetting connection"
+                );
+                // B23: the frame is gone and the seq stream is broken —
+                // fail fast instead of stalling the conn for minutes.
+                fail_pending_conn(ctx, &cid);
                 return Ok(());
             }
             if let Some(mut entry) = ctx.pending.get_mut(&cid) {
@@ -921,18 +904,31 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     warn!(
                         conn_id = cid,
                         count = entry.frames.len(),
-                        "pending overflow, dropping DATA"
+                        "pending overflow, resetting connection"
                     );
                     ctx.pending_bytes.fetch_sub(plen, Ordering::Relaxed);
+                    drop(entry);
+                    // B23: fail fast — see above.
+                    fail_pending_conn(ctx, &cid);
                 }
             } else {
                 // Entry vanished between contains_key and get_mut —
                 // refund the reservation.
                 ctx.pending_bytes.fetch_sub(plen, Ordering::Relaxed);
+                // B27: the SYN handler may have just established the
+                // conn — deliver through the normal path instead of
+                // dropping the frame (which would leave a seq gap).
+                if ctx.conns.contains_key(&cid) {
+                    return Box::pin(handle_frame(frame, ctx)).await;
+                }
             }
         } else if ctx.pending.len() < MAX_PENDING_CIDS {
             if !try_reserve_pending(ctx, None, plen) {
-                warn!(conn_id = cid, "pending byte budget exhausted, dropping DATA");
+                warn!(
+                    conn_id = cid,
+                    "pending byte budget exhausted, resetting connection"
+                );
+                fail_pending_conn(ctx, &cid);
                 return Ok(());
             }
             let mut entry = PendingEntry::new();
@@ -940,7 +936,11 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             entry.bytes = plen;
             ctx.pending.insert(cid, entry);
         } else {
-            warn!(conn_id = cid, "pending CID limit reached, dropping DATA");
+            warn!(
+                conn_id = cid,
+                "pending CID limit reached, resetting connection"
+            );
+            fail_pending_conn(ctx, &cid);
         }
         return Ok(());
     }
@@ -970,7 +970,11 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 if entry.frames.len() < MAX_PENDING_FRAMES_PER_CID {
                     entry.frames.push(frame);
                 } else {
-                    warn!(conn_id = cid, "pending overflow, dropping FIN");
+                    warn!(conn_id = cid, "pending overflow, resetting connection");
+                    drop(entry);
+                    // B23: a dropped FIN would leave the splitter waiting
+                    // out its 60s quiet timeout — fail fast instead.
+                    fail_pending_conn(ctx, &cid);
                 }
             }
         } else if ctx.pending.len() < MAX_PENDING_CIDS {
@@ -978,7 +982,11 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             entry.frames.push(frame);
             ctx.pending.insert(cid, entry);
         } else {
-            warn!(conn_id = cid, "pending CID limit reached, dropping FIN");
+            warn!(
+                conn_id = cid,
+                "pending CID limit reached, resetting connection"
+            );
+            fail_pending_conn(ctx, &cid);
         }
         return Ok(());
     }
@@ -1002,11 +1010,10 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 if let Some(notify) = &entry.cancel {
                     notify.notify_one();
                 }
-            } else if ctx.pending.len() < MAX_PENDING_CIDS {
-                let mut entry = PendingEntry::new();
-                entry.cancelled = true;
-                ctx.pending.insert(cid, entry);
             }
+            // B27: no phantom cancelled entry — the SYN handler itself
+            // re-checks the closed tombstone after creating its pending
+            // slot, which also covers the window before that slot exists.
             ctx.closed.insert(cid, Instant::now());
         }
         return Ok(());
@@ -1024,17 +1031,44 @@ fn remove_pending(ctx: &ReadLoopCtx, cid: &u32) -> Option<PendingEntry> {
     entry
 }
 
+/// B23: a pending DATA/FIN frame had to be dropped — the connection's
+/// seq stream is permanently broken (TCP tunnels never retransmit), so
+/// fail fast: cancel any pending entry, tombstone the cid and reset
+/// both sides instead of stalling the connection for minutes.
+fn fail_pending_conn(ctx: &ReadLoopCtx, cid: &u32) {
+    if let Some(mut entry) = ctx.pending.get_mut(cid) {
+        entry.cancelled = true;
+        if let Some(notify) = &entry.cancel {
+            notify.notify_one();
+        }
+    }
+    ctx.closed.insert(*cid, Instant::now());
+    ctx.pool.send(Frame::rst(*cid));
+}
+
 /// Reserve `need` bytes against the global pending budget, evicting the
 /// oldest *other* entries when over budget (BUG-7).  Returns false when
 /// the budget can't be satisfied.
 fn try_reserve_pending(ctx: &ReadLoopCtx, exclude: Option<u32>, need: usize) -> bool {
-    if ctx.pending_bytes.load(Ordering::Relaxed) + need <= MAX_PENDING_BYTES {
-        ctx.pending_bytes.fetch_add(need, Ordering::Relaxed);
-        return true;
-    }
-    // Over budget: evict oldest entries (other than `exclude`) until the
-    // frame fits.  DashMap refs must be dropped before remove().
     loop {
+        // B32: atomic check-and-add (CAS) — the old load + fetch_add
+        // pair let concurrent arrivals all pass the pre-check and
+        // overshoot the budget.
+        let mut current = ctx.pending_bytes.load(Ordering::Relaxed);
+        while current + need <= MAX_PENDING_BYTES {
+            match ctx.pending_bytes.compare_exchange_weak(
+                current,
+                current + need,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+        // Over budget: evict oldest entries (other than the excluded
+        // one) until the frame fits.  DashMap refs must be dropped
+        // before remove().
         if ctx.pending.is_empty() {
             return false;
         }
@@ -1053,10 +1087,7 @@ fn try_reserve_pending(ctx: &ReadLoopCtx, exclude: Option<u32>, need: usize) -> 
             continue;
         }
         ctx.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        if ctx.pending_bytes.load(Ordering::Relaxed) + need <= MAX_PENDING_BYTES {
-            ctx.pending_bytes.fetch_add(need, Ordering::Relaxed);
-            return true;
-        }
+        // Loop back and retry the CAS with the freed budget.
     }
 }
 
@@ -1077,19 +1108,6 @@ async fn forward_udp_datagram(vconn: &VirtConnDe, payload: &[u8]) {
         return;
     };
     if let Err(e) = sock.send_to(&target.address, target.port, &data).await {
-        warn!(error = %e, target = %target.address, port = target.port, "UDP send_to failed");
-    }
-}
-
-async fn handle_udp_frame(frame: Frame, udp_sock: &UdpPair) {
-    let (target, data) = match socks5::decode_udp_datagram(&frame.payload) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(error = %e, "UDP datagram decode failed");
-            return;
-        }
-    };
-    if let Err(e) = udp_sock.send_to(&target.address, target.port, &data).await {
         warn!(error = %e, target = %target.address, port = target.port, "UDP send_to failed");
     }
 }
@@ -1303,5 +1321,102 @@ fn finish_if_done(
             "closed"
         );
         drop(vc);
+    }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ctx() -> (ReadLoopCtx, mpsc::Receiver<Frame>) {
+        let (tx, rx) = mpsc::channel::<Frame>(TUNNEL_CHANNEL_CAP);
+        let link = Arc::new(TunnelLink {
+            tx,
+            alive: AtomicBool::new(true),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
+            stop: Arc::new(Notify::new()),
+            lost_frames: Mutex::new(Vec::new()),
+        });
+        let pool = Arc::new(TunnelPool::new());
+        pool.add(link.clone());
+        let ctx = ReadLoopCtx {
+            conns: Arc::new(DashMap::new()),
+            pending: Arc::new(DashMap::new()),
+            closed: Arc::new(DashMap::new()),
+            handshaking: Arc::new(DashMap::new()),
+            pool,
+            local_target: "127.0.0.1:9".parse().unwrap(),
+            chunk_size: 4096,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            resets: Arc::new(AtomicU64::new(0)),
+            link,
+        };
+        (ctx, rx)
+    }
+
+    /// B23 regression: pending DATA overflow must reset the connection
+    /// (RST + tombstone + cancelled entry) instead of silently dropping
+    /// the frame and stalling the conn.
+    #[tokio::test]
+    async fn pending_data_overflow_fails_fast() {
+        let (ctx, mut rx) = make_ctx();
+        let cid = 42u32;
+        let mut entry = PendingEntry::new();
+        for _ in 0..MAX_PENDING_FRAMES_PER_CID {
+            entry.frames.push(Frame::data(cid, 0, Bytes::new()));
+        }
+        ctx.pending.insert(cid, entry);
+        handle_frame(Frame::data(cid, 1, Bytes::from_static(b"x")), &ctx)
+            .await
+            .unwrap();
+        let got = rx.recv().await.expect("expected an RST on the pool");
+        assert_eq!(got.conn_id, cid);
+        assert_eq!(got.flags, FLAG_RST);
+        assert!(ctx.closed.contains_key(&cid), "cid must be tombstoned");
+        assert!(
+            ctx.pending.get(&cid).unwrap().cancelled,
+            "pending entry must be cancelled"
+        );
+    }
+
+    /// B23 regression: FIN dropped at the pending-CID limit must fail
+    /// fast instead of leaving the splitter to wait out its quiet timeout.
+    #[tokio::test]
+    async fn pending_fin_drop_fails_fast() {
+        let (ctx, mut rx) = make_ctx();
+        for i in 1..=MAX_PENDING_CIDS as u32 {
+            ctx.pending.insert(i, PendingEntry::new());
+        }
+        let cid = 777u32;
+        handle_frame(Frame::fin(cid, 7), &ctx).await.unwrap();
+        let got = rx.recv().await.expect("expected an RST on the pool");
+        assert_eq!(got.conn_id, cid);
+        assert_eq!(got.flags, FLAG_RST);
+        assert!(ctx.closed.contains_key(&cid));
+    }
+
+    /// B30 regression: unknown SYN proto must be rejected with RST.
+    #[tokio::test]
+    async fn unknown_syn_proto_resets() {
+        let (ctx, mut rx) = make_ctx();
+        let cid = 5u32;
+        let payload = SynTarget {
+            proto: 0x99,
+            address: "example.com".into(),
+            port: 80,
+        }
+        .encode()
+        .unwrap();
+        handle_frame(Frame::syn(cid, payload), &ctx).await.unwrap();
+        let got = rx.recv().await.expect("expected an RST on the pool");
+        assert_eq!(got.conn_id, cid);
+        assert_eq!(got.flags, FLAG_RST);
+        assert!(ctx.closed.contains_key(&cid));
+        assert!(!ctx.handshaking.contains_key(&cid));
     }
 }

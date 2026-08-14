@@ -124,9 +124,7 @@ pub fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
                 }
                 let count = end as usize - start as usize + 1;
                 if count > MAX_PORTS {
-                    bail!(
-                        "port range {start}-{end} has {count} ports, max {MAX_PORTS}"
-                    );
+                    bail!("port range {start}-{end} has {count} ports, max {MAX_PORTS}");
                 }
                 (start..=end).collect()
             } else {
