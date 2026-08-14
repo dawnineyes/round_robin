@@ -431,15 +431,10 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
             }
         };
         let _ = stream.set_nodelay(true);
-        // Random conn_id — collision probability ~ N²/2³² (< 0.01% at 1000 conns)
-        let conn_id = match alloc_conn_id(&conns, &time_wait) {
-            Some(id) => id,
-            None => {
-                // Practically unreachable (2³² ids), but never loop forever.
-                warn!(peer = %peer, "conn_id space exhausted, dropping connection");
-                continue;
-            }
-        };
+        // B40: conn_id allocation moved into handle_client — an id drawn
+        // here would sit unoccupied across the (up to 15s) SOCKS5
+        // handshake, letting a second accept draw the same id and later
+        // overwrite the first conn's conns entry.
         let pool = pool.clone();
         let conns = conns.clone();
         let time_wait = time_wait.clone();
@@ -450,7 +445,6 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
 
         tokio::spawn(async move {
             let ctx = ClientCtx {
-                conn_id,
                 peer,
                 pool: pool.clone(),
                 conns: conns.clone(),
@@ -462,7 +456,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 conn_slot,
             };
             if let Err(e) = handle_client(stream, ctx).await {
-                warn!(conn_id, peer = %peer, error = %e, "client handler failed");
+                warn!(peer = %peer, error = %e, "client handler failed");
             }
         });
     }
@@ -626,7 +620,6 @@ fn reset_conn(
 // ── Client handler ────────────────────────────────────────────────────
 
 struct ClientCtx {
-    conn_id: u32,
     peer: SocketAddr,
     pool: Arc<TunnelPool>,
     conns: ConnMap,
@@ -657,51 +650,59 @@ async fn handle_client(stream: TcpStream, ctx: ClientCtx) -> Result<()> {
         };
     ctx.half_open.fetch_sub(1, Ordering::AcqRel);
     ctx.conn_slot.notify_one();
-    let accepted = accepted?;
+    let (accepted, reply) = accepted?;
+    // B40: allocate the conn_id only after the handshake completes — an
+    // id allocated earlier would sit unoccupied for up to HANDSHAKE_TIMEOUT
+    // and a second accept could draw the same id, so the two conns would
+    // later overwrite each other's conns entry.  Post-handshake allocation
+    // leaves only the instruction-wide alloc→insert window (the inherent
+    // 2⁻³² random bound).
+    let conn_id = match alloc_conn_id(&ctx.conns, &ctx.time_wait) {
+        Some(id) => id,
+        None => {
+            // Practically unreachable (2³² ids), but never loop forever.
+            warn!(peer = %ctx.peer, "conn_id space exhausted, dropping connection");
+            return Ok(());
+        }
+    };
     // B32: the handler is about to finish — a connection slot frees up.
     // Wake the accept loop so it re-checks the limit promptly.
     let result = match accepted {
         socks5::Socks5Result::Connect(accepted) => {
-            handle_tcp_client(
-                ctx.conn_id,
-                accepted,
-                ctx.peer,
-                &ctx.pool,
-                &ctx.conns,
-                &ctx.time_wait,
-                ctx.chunk_size,
-            )
-            .await
+            handle_tcp_client(conn_id, accepted, reply, &ctx).await
         }
         socks5::Socks5Result::UdpAssociate {
             stream: keepalive,
             relay,
-        } => {
-            handle_udp_client(
-                &ctx.pool,
-                &ctx.conns,
-                &ctx.time_wait,
-                relay,
-                keepalive,
-                ctx.udp_sent.clone(),
-                ctx.udp_recv.clone(),
-            )
-            .await
-        }
+        } => handle_udp_client(relay, keepalive, reply, &ctx).await,
     };
     ctx.conn_slot.notify_one();
     result
 }
 
+/// B35: write a SOCKS5 reply with a bounded timeout.  The reply moved out
+/// of socks5_server_accept's handshake timeout (deferred until the tunnel
+/// SYN is queued), so a peer that stops reading must not pin the handler.
+async fn send_socks5_reply(stream: &mut TcpStream, rep: &[u8]) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(rep)).await;
+}
+
 async fn handle_tcp_client(
     conn_id: u32,
-    accepted: socks5::Socks5Accept,
-    peer: SocketAddr,
-    pool: &TunnelPool,
-    conns: &ConnMap,
-    time_wait: &DashMap<u32, Instant>,
-    chunk_size: usize,
+    mut accepted: socks5::Socks5Accept,
+    reply: Vec<u8>,
+    ctx: &ClientCtx,
 ) -> Result<()> {
+    // Bundled context (B35: the reply param grew the arg list past
+    // clippy's limit — mirror EgressReaderCtx's style).
+    let ClientCtx {
+        peer,
+        pool,
+        conns,
+        time_wait,
+        ..
+    } = ctx;
+    let chunk_size = ctx.chunk_size;
     info!(conn_id, peer = %peer, target = %accepted.target.address, port = accepted.target.port, "accepted");
 
     let syn_target = SynTarget {
@@ -737,16 +738,15 @@ async fn handle_tcp_client(
     if !pool.send(syn_frame) {
         // B25: only remove OUR entry.
         conns.remove_if(&conn_id, |_, v| Arc::ptr_eq(v, &vconn));
-        // BUG-10: the SOCKS5 success reply was already sent — tell the
-        // client the connection actually failed instead of a bare EOF.
+        // BUG-10/B35: the success reply is deferred until the SYN is
+        // queued, so on failure the client gets a deterministic
+        // REP_GENERAL_FAILURE — never success-then-garbage-then-EOF.
         let mut client_stream = accepted.stream;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            client_stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
-        )
-        .await;
+        send_socks5_reply(&mut client_stream, &socks5::REPLY_GENERAL_FAILURE).await;
         bail!("no live tunnels to send SYN");
     }
+    // B35: the SYN is queued — the client may learn of success now.
+    send_socks5_reply(&mut accepted.stream, &reply).await;
 
     let (mut client_reader, mut client_writer) = accepted.stream.into_split();
 
@@ -911,14 +911,20 @@ async fn handle_tcp_client(
 /// conn and announced via SYN proto=UDP) — multiple clients can relay
 /// concurrently instead of fighting over UDP_CONN_ID.
 async fn handle_udp_client(
-    pool: &TunnelPool,
-    conns: &ConnMap,
-    time_wait: &DashMap<u32, Instant>,
     relay: UdpSocket,
     keepalive: TcpStream,
-    udp_sent: Arc<AtomicU64>,
-    udp_recv: Arc<AtomicU64>,
+    reply: Vec<u8>,
+    ctx: &ClientCtx,
 ) -> Result<()> {
+    // Bundled context (see handle_tcp_client).
+    let ClientCtx {
+        pool,
+        conns,
+        time_wait,
+        udp_sent,
+        udp_recv,
+        ..
+    } = ctx;
     let relay = Arc::new(relay);
     let relay_addr = relay.local_addr()?;
     let conn_id = alloc_conn_id(conns, time_wait)
@@ -958,15 +964,22 @@ async fn handle_udp_client(
     );
     if !pool.send(syn) {
         conns.remove(&conn_id);
+        // B35: success reply deferred until the SYN is queued — send a
+        // deterministic REP_GENERAL_FAILURE instead of success-then-EOF.
+        let mut ka = keepalive;
+        send_socks5_reply(&mut ka, &socks5::REPLY_GENERAL_FAILURE).await;
         bail!("no live tunnels to send UDP SYN");
     }
+    // B35: the SYN is queued — the client may learn of success now.
+    let mut ka = keepalive;
+    send_socks5_reply(&mut ka, &reply).await;
 
     // Track SOCKS5 client address so we can send_to (socket is unconnected).
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
 
     let relay2 = relay.clone();
     let ca = client_addr.clone();
-    let recv_ctr = udp_recv.clone();
+    let recv_ctr = Arc::clone(udp_recv);
     tokio::spawn(async move {
         while let Some(dgram) = to_udp_rx.recv().await {
             recv_ctr.fetch_add(1, Ordering::Relaxed);
@@ -986,7 +999,7 @@ async fn handle_udp_client(
         // B31: RFC 1928 — the association is tied to the TCP control
         // connection's lifetime (EOF), not to stray bytes arriving on
         // it.  Loop until EOF or error.
-        let mut ka = keepalive;
+        let mut ka = ka;
         let mut buf = [0u8; 1];
         loop {
             match ka.read(&mut buf).await {
@@ -1009,7 +1022,25 @@ async fn handle_udp_client(
                         break;
                     }
                 };
-                *client_addr.lock().unwrap() = Some(client);
+                // B39: only the associating client may inject datagrams —
+                // responses go to the first sender, so an unverified
+                // source could both inject traffic and steal responses.
+                {
+                    let mut ca = client_addr.lock().unwrap();
+                    match *ca {
+                        None => *ca = Some(client),
+                        Some(known) if known == client => {}
+                        Some(known) => {
+                            warn!(
+                                conn_id,
+                                from = %client,
+                                expected = %known,
+                                "UDP relay: dropping datagram from unexpected source"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 udp_sent.fetch_add(1, Ordering::Relaxed);
                 let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
                 let mut sent = false;

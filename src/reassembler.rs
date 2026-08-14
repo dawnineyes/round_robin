@@ -233,16 +233,16 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                 );
             }
             // Sweep stale pending entries that never got a SYN, refunding
-            // their byte budget (BUG-7).
-            let mut freed = 0usize;
-            hb_pending.retain(|_, entry| {
-                let keep = entry.since.elapsed().as_secs() < PENDING_TTL_SECS;
-                if !keep {
-                    freed += entry.bytes;
-                }
-                keep
-            });
-            hb_pending_bytes.fetch_sub(freed, Ordering::Relaxed);
+            // their byte budget (BUG-7) and resetting the affected cids
+            // (B34 — the buffered frames are gone, so fail fast instead
+            // of letting the splitter re-buffer into a new entry forever).
+            sweep_stale_pending(
+                &hb_pending,
+                &hb_pending_bytes,
+                &hb_closed,
+                &hb_pool,
+                PENDING_TTL_SECS,
+            );
             let uptime = start_time.elapsed().as_secs();
             info!(
                 uptime,
@@ -548,7 +548,25 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             let (write_tx, _write_rx) = mpsc::channel::<Bytes>(1);
             let cancel = Arc::new(Notify::new());
             let half_close = Arc::new(Notify::new());
-            let udp_sock = Arc::new(bind_udp_pair().await?);
+            // B38: a UDP socket bind failure must not propagate out of
+            // handle_frame — the `?` used to kill the entire tunnel read
+            // loop (all conns on the tunnel stall for the 3s+ reconnect)
+            // for one unusable association.  Fail just this cid instead.
+            let udp_sock = match bind_udp_pair().await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    warn!(
+                        conn_id = cid,
+                        error = %e,
+                        "UDP socket bind failed, resetting connection"
+                    );
+                    remove_pending(ctx, &cid);
+                    ctx.handshaking.remove(&cid);
+                    ctx.closed.insert(cid, Instant::now());
+                    ctx.pool.send(Frame::rst(cid));
+                    return Ok(());
+                }
+            };
             let vconn = Arc::new(VirtConnDe {
                 egress: EgressConn { write_tx },
                 reorder: Mutex::new(ReorderBuf::new()),
@@ -704,6 +722,20 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         };
         let _ = egress_stream.set_nodelay(true);
 
+        // B33/B36: an RST (or pending eviction/sweep) may have raced the
+        // connect and tombstoned this cid after the pre-connect check —
+        // don't build an egress connection for a conn the splitter
+        // already reset.
+        if ctx.closed.contains_key(&cid) {
+            warn!(
+                conn_id = cid,
+                "SYN closed while connecting, dropping egress"
+            );
+            remove_pending(ctx, &cid);
+            ctx.handshaking.remove(&cid);
+            return Ok(());
+        }
+
         let (egress_rd, egress_wr) = egress_stream.into_split();
         let (write_tx, write_rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
         let cancel = Arc::new(Notify::new());
@@ -807,12 +839,17 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             if vconn.is_udp {
                 // BUG-19: UDP relay conn — forward the datagram directly
                 // through the conn's own socket (no ordering, no routes).
-                forward_udp_datagram(&vconn, &frame.payload).await;
-                vconn
-                    .bytes_recv
+                // B37: clone out of the DashMap shard guard before the
+                // await — a domain target triggers DNS inside
+                // forward_udp_datagram, and holding the guard across it
+                // would stall every other conn in this shard.
+                let vc = vconn.clone();
+                drop(vconn);
+                forward_udp_datagram(&vc, &frame.payload).await;
+                vc.bytes_recv
                     .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
-                vconn.frames_recv.fetch_add(1, Ordering::Relaxed);
-                *vconn.last_active.lock().unwrap() = Instant::now();
+                vc.frames_recv.fetch_add(1, Ordering::Relaxed);
+                *vc.last_active.lock().unwrap() = Instant::now();
                 return Ok(());
             }
             let plen = frame.payload.len() as u64;
@@ -1004,18 +1041,18 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
         // BUG-1/BUG-4: RST while the SYN handshake is in flight — mark
         // the pending entry so the SYN handler aborts the egress connect
         // instead of building a connection nobody wants.
-        if ctx.handshaking.contains_key(&cid) || ctx.pending.contains_key(&cid) {
-            if let Some(mut entry) = ctx.pending.get_mut(&cid) {
-                entry.cancelled = true;
-                if let Some(notify) = &entry.cancel {
-                    notify.notify_one();
-                }
+        if let Some(mut entry) = ctx.pending.get_mut(&cid) {
+            entry.cancelled = true;
+            if let Some(notify) = &entry.cancel {
+                notify.notify_one();
             }
-            // B27: no phantom cancelled entry — the SYN handler itself
-            // re-checks the closed tombstone after creating its pending
-            // slot, which also covers the window before that slot exists.
-            ctx.closed.insert(cid, Instant::now());
         }
+        // B27/B36: tombstone unconditionally, even for a completely
+        // unknown cid — an RST processed in the window between the SYN
+        // handler's conns check and its handshaking registration used to
+        // be dropped, and the egress connection was then built for a conn
+        // the splitter already reset.  Bounded by the CLOSED_TTL sweep.
+        ctx.closed.insert(cid, Instant::now());
         return Ok(());
     }
 
@@ -1029,6 +1066,38 @@ fn remove_pending(ctx: &ReadLoopCtx, cid: &u32) -> Option<PendingEntry> {
         ctx.pending_bytes.fetch_sub(e.bytes, Ordering::Relaxed);
     }
     entry
+}
+
+/// B34: sweep stale pending entries (never got a SYN within `ttl`),
+/// refund their byte budget and fail fast the affected cids (abort any
+/// in-flight SYN handshake, tombstone, RST) — the queued frames are
+/// gone forever, so without a reset the splitter would keep buffering
+/// into a fresh entry and repeat the cycle silently.
+fn sweep_stale_pending(
+    pending: &PendingMap,
+    pending_bytes: &AtomicUsize,
+    closed: &DashMap<u32, Instant>,
+    pool: &TunnelPool,
+    ttl_secs: u64,
+) {
+    let mut freed = 0usize;
+    let mut swept: Vec<(u32, Option<Arc<Notify>>)> = Vec::new();
+    pending.retain(|&cid, entry| {
+        let keep = entry.since.elapsed().as_secs() < ttl_secs;
+        if !keep {
+            freed += entry.bytes;
+            swept.push((cid, entry.cancel.clone()));
+        }
+        keep
+    });
+    pending_bytes.fetch_sub(freed, Ordering::Relaxed);
+    for (cid, cancel) in swept {
+        if let Some(notify) = &cancel {
+            notify.notify_one();
+        }
+        closed.insert(cid, Instant::now());
+        pool.send(Frame::rst(cid));
+    }
 }
 
 /// B23: a pending DATA/FIN frame had to be dropped — the connection's
@@ -1081,12 +1150,22 @@ fn try_reserve_pending(ctx: &ReadLoopCtx, exclude: Option<u32>, need: usize) -> 
             return false;
         };
         let (key, bytes) = (*entry_ref.key(), entry_ref.bytes);
+        let cancel = entry_ref.cancel.clone();
         drop(entry_ref);
         if ctx.pending.remove(&key).is_none() {
             // Raced — another task removed it and already refunded.
             continue;
         }
         ctx.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        // B33: the evicted cid's queued frames are gone forever (TCP
+        // tunnels never retransmit) — fail fast like a dropped frame:
+        // abort any in-flight SYN handshake, tombstone the cid and reset
+        // both sides instead of silently truncating the request.
+        if let Some(notify) = &cancel {
+            notify.notify_one();
+        }
+        ctx.closed.insert(key, Instant::now());
+        ctx.pool.send(Frame::rst(key));
         // Loop back and retry the CAS with the freed budget.
     }
 }
@@ -1418,5 +1497,75 @@ mod tests {
         assert_eq!(got.flags, FLAG_RST);
         assert!(ctx.closed.contains_key(&cid));
         assert!(!ctx.handshaking.contains_key(&cid));
+    }
+
+    /// B33 regression: evicting the oldest pending entry to free budget
+    /// must fail fast the evicted cid (RST + tombstone) instead of
+    /// silently dropping its queued frames and truncating the request.
+    #[tokio::test]
+    async fn pending_eviction_resets_evicted_cid() {
+        let (ctx, mut rx) = make_ctx();
+        let evicted = 42u32;
+        let mut entry = PendingEntry::new();
+        entry.bytes = MAX_PENDING_BYTES; // consume the whole budget
+        ctx.pending.insert(evicted, entry);
+        ctx.pending_bytes
+            .store(MAX_PENDING_BYTES, Ordering::Relaxed);
+        // Reserve for a new cid — must evict the oldest entry (42).
+        assert!(try_reserve_pending(&ctx, None, 1));
+        let got = rx.recv().await.expect("expected an RST on the pool");
+        assert_eq!(got.conn_id, evicted);
+        assert_eq!(got.flags, FLAG_RST);
+        assert!(
+            ctx.closed.contains_key(&evicted),
+            "evicted cid must be tombstoned"
+        );
+        assert!(
+            !ctx.pending.contains_key(&evicted),
+            "evicted entry must be gone"
+        );
+    }
+
+    /// B34 regression: the pending TTL sweep must RST the swept cid (and
+    /// refund its byte budget) so a lost-SYN conn fails fast instead of
+    /// silently re-buffering into a fresh entry forever.
+    #[tokio::test]
+    async fn pending_sweep_resets_swept_cid() {
+        let (ctx, mut rx) = make_ctx();
+        let cid = 55u32;
+        let mut entry = PendingEntry::new();
+        entry.bytes = 1234;
+        ctx.pending.insert(cid, entry);
+        ctx.pending_bytes.store(1234, Ordering::Relaxed);
+        // ttl=0 forces every entry stale.
+        sweep_stale_pending(&ctx.pending, &ctx.pending_bytes, &ctx.closed, &ctx.pool, 0);
+        let got = rx.recv().await.expect("expected an RST on the pool");
+        assert_eq!(got.conn_id, cid);
+        assert_eq!(got.flags, FLAG_RST);
+        assert!(
+            ctx.closed.contains_key(&cid),
+            "swept cid must be tombstoned"
+        );
+        assert!(!ctx.pending.contains_key(&cid), "swept entry must be gone");
+        assert_eq!(
+            ctx.pending_bytes.load(Ordering::Relaxed),
+            0,
+            "budget must be refunded"
+        );
+    }
+
+    /// B36 regression: an RST for a cid with no conn / pending / handshake
+    /// state must still tombstone — otherwise a RST landing in the window
+    /// before the SYN handler registers its entries would be dropped and
+    /// a ghost egress built for a conn the splitter already reset.
+    #[tokio::test]
+    async fn rst_for_unknown_cid_tombstones() {
+        let (ctx, _rx) = make_ctx();
+        let cid = 99u32;
+        handle_frame(Frame::rst(cid), &ctx).await.unwrap();
+        assert!(
+            ctx.closed.contains_key(&cid),
+            "RST for unknown cid must tombstone"
+        );
     }
 }

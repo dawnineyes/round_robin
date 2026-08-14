@@ -15,6 +15,12 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const REP_SUCCESS: u8 = 0x00;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
+/// RFC 1928 §6 reply sent when a connection cannot be established
+/// (B35: the success reply is deferred until the SYN is queued, so on
+/// failure the client gets this deterministic error instead of garbage
+/// bytes appended after an already-sent success).
+pub const REPLY_GENERAL_FAILURE: [u8; 10] =
+    [SOCKS_VERSION, 0x01, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
 
 // ── Server-side: accept a SOCKS5 client ───────────────────────────────
 
@@ -39,8 +45,10 @@ pub struct TargetAddr {
 /// Perform SOCKS5 server-side handshake on `stream`:
 /// 1. Read greeting → negotiate no-auth
 /// 2. Read request → if CONNECT, parse target; if UDP ASSOCIATE, create relay
-/// 3. Reply success
-pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result> {
+/// 3. Return the success reply (B35: the caller writes it only after the
+///    tunnel SYN is queued, so a tunnel failure produces a deterministic
+///    REP_GENERAL_FAILURE instead of success-then-garbage-then-EOF).
+pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<(Socks5Result, Vec<u8>)> {
     // 1. Greeting
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr).await?;
@@ -72,7 +80,10 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result>
     match req[1] {
         CMD_CONNECT => {
             let target = read_address(&mut stream, req[3]).await?;
-            let rep = [
+            // B35: success reply deferred — the caller writes it once the
+            // tunnel SYN is queued, so a tunnel failure can still send a
+            // deterministic REP_GENERAL_FAILURE instead.
+            let rep = vec![
                 SOCKS_VERSION,
                 REP_SUCCESS,
                 0x00,
@@ -84,8 +95,7 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result>
                 0,
                 0,
             ];
-            stream.write_all(&rep).await?;
-            Ok(Socks5Result::Connect(Socks5Accept { target, stream }))
+            Ok((Socks5Result::Connect(Socks5Accept { target, stream }), rep))
         }
         CMD_UDP_ASSOCIATE => {
             let client_addr = read_address(&mut stream, req[3]).await?;
@@ -93,10 +103,12 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<Socks5Result>
             let local = stream.local_addr()?;
             let relay = UdpSocket::bind((local.ip(), 0u16)).await?;
             let relay_addr = relay.local_addr()?;
+            // B35: deferred like CONNECT — the relay is useless if no
+            // tunnel can carry the association's SYN, so the caller writes
+            // success only after the SYN is queued.
             let rep = encode_reply(REP_SUCCESS, relay_addr);
-            stream.write_all(&rep).await?;
             let _ = client_addr; // ponytail: client_addr unused for single-client setup
-            Ok(Socks5Result::UdpAssociate { stream, relay })
+            Ok((Socks5Result::UdpAssociate { stream, relay }, rep))
         }
         other => {
             let rep = [

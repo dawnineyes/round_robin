@@ -6,6 +6,40 @@
 
 ---
 
+## Phase 13: 第三轮 Bug 审查修复（v1.10.8）
+
+> **基线**: v1.10.7
+> **来源**: `BUG_REVIEW_v1107.md`（B33–B40）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/reassembler.rs` | pending 字节预算逐出最旧条目时对被逐出 cid 失败快（取消在途握手 + closed 墓碑 + RST，含单测）；pending TTL 清扫提取为 `sweep_stale_pending()` 并在清扫时同样失败快（含单测）；RST 分支对完全未知 cid 也写 closed 墓碑（含单测）；SYN 建连后补 closed 复核，封堵逐出/清扫/早到 RST 的幽灵 egress 窗口；UDP DATA 分支先克隆 vconn、释放 DashMap shard 引用再 await（DNS/send_to 不再头部阻塞同 shard 连接）；`bind_udp_pair` 失败只重置该 cid，不再经 `?` 杀死整条隧道读循环 | B33/B34/B36/B37/B38 |
+| `src/socks5.rs` | `socks5_server_accept` 不再发送成功应答，改为返回 `(Socks5Result, Vec<u8>)`；新增 `REPLY_GENERAL_FAILURE` 常量 | B35 |
+| `src/splitter.rs` | 成功应答推迟到隧道 SYN 入队成功后发送（TCP 与 UDP ASSOCIATE 两路径，新增带 5s 超时的 `send_socks5_reply`），失败时发确定性失败应答；UDP 中继只接受首个客户端来源的数据报；conn_id 分配从 accept 循环移到 SOCKS5 握手完成后（消除握手期 id 可重复分配窗口）；`handle_tcp_client`/`handle_udp_client` 参数改为传 `&ClientCtx`（消除 clippy too_many_arguments） | B35/B39/B40 |
+| `Cargo.toml` | 版本 1.10.7 → 1.10.8 | 发布 |
+
+### 行为变化
+
+- **B33 修复**: pending 预算逐出不再静默丢弃被逐出连接的请求数据——逐出即 RST，双方快速失败，目标端不再收到截断请求
+- **B34 修复**: SYN 丢失且重发失败的连接不再陷入"缓冲→30s 清扫→再缓冲"死循环——清扫即 RST，splitter 立即拆除
+- **B35 修复**: 无隧道时 SOCKS5 客户端收到 REP_GENERAL_FAILURE 而非"成功应答 + 垃圾字节 + EOF"，可确定性区分目标拒绝与隧道故障
+- **B36 修复**: RST 在 SYN 注册前到达不再被丢弃，未知 cid 一律写墓碑（60s TTL 清扫兜底）
+- **B37 修复**: UDP 域名目标的 DNS 解析不再阻塞 DashMap 同 shard 的其他连接
+- **B38 修复**: UDP socket 绑定失败只影响该关联，不再中断整条隧道的所有连接
+- **B39 修复**: UDP 中继仅接受关联客户端的来源地址，阻断注入与响应窃取
+- **B40 修复**: conn_id 仅在握手完成后分配，消除握手期（≤15s）重复分配的窗口
+
+### 测试结果
+
+- `cargo test`: 30/30 单元测试 + 4/4 e2e 集成测试通过（新增 3 个回归：`pending_eviction_resets_evicted_cid`、`pending_sweep_resets_swept_cid`、`rst_for_unknown_cid_tombstones`）
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --release`: 见发布流程
+
+---
+
 ## Phase 12: 第二轮 Bug 审查修复（v1.10.7）
 
 > **基线**: v1.10.6
