@@ -39,6 +39,12 @@ curl -sSfL https://raw.githubusercontent.com/dawnineyes/round_robin/master/insta
 sudo systemctl restart round_robin
 ```
 
+安装指定版本（默认安装最新 release，如 `v1.10.10`）：
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/dawnineyes/round_robin/master/install.sh | bash -s -- v1.10.4
+```
+
 `/opt/round_robin/config.toml`：
 
 ```toml

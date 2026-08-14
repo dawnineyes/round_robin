@@ -9,18 +9,31 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
 
 echo "=== round_robin installer ==="
 
-# ── Fetch latest release ───────────────────────────────────────────────
+# ── Fetch release (pinned version or latest) ───────────────────────────
 
-echo "Fetching latest release..."
-RELEASE=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest")
+# Optional positional argument: `install.sh v1.10.4` installs that exact
+# release; without it the latest release is installed.
+PINNED_TAG="${1:-}"
+if [ -n "$PINNED_TAG" ] && ! echo "$PINNED_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "ERROR: invalid version '$PINNED_TAG' (expected e.g. v1.10.4)"
+    exit 1
+fi
+
+if [ -n "$PINNED_TAG" ]; then
+    echo "Fetching release $PINNED_TAG ..."
+    RELEASE=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/tags/${PINNED_TAG}")
+else
+    echo "Fetching latest release..."
+    RELEASE=$(curl -sSf "https://api.github.com/repos/${REPO}/releases/latest")
+fi
 TAG=$(echo "$RELEASE" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)".*/\1/')
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${BINARY}"
 
 if [ -z "$TAG" ]; then
-    echo "ERROR: failed to fetch latest release"
+    echo "ERROR: failed to fetch ${PINNED_TAG:-latest} release (does the release/tag exist?)"
     exit 1
 fi
-echo "Latest version: $TAG"
+echo "Target version: $TAG"
 
 # ── Stop running service ───────────────────────────────────────────────
 
