@@ -40,6 +40,12 @@ pub struct SplitterConfig {
     /// Heartbeat / connection-sweep interval in seconds (O5).
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
+    /// B58: per-connection reorder-window byte budget.  Must cover the
+    /// sender's in-flight window (tunnels × 128 frames × chunk_size —
+    /// 32 MB for 4 tunnels at the default chunk) or latency skew
+    /// between tunnels overflows the window and resets the connection.
+    #[serde(default = "default_reorder_window")]
+    pub reorder_window_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +65,10 @@ pub struct ReassemblerConfig {
     /// reassembler previously hardcoded 60s).
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
+    /// B58: per-connection reorder-window byte budget (uploads flow this
+    /// direction; same in-flight math as the splitter's).
+    #[serde(default = "default_reorder_window")]
+    pub reorder_window_bytes: u64,
 }
 
 fn default_data_send_timeout() -> u64 {
@@ -67,6 +77,11 @@ fn default_data_send_timeout() -> u64 {
 
 fn default_heartbeat() -> u64 {
     60
+}
+
+/// B58: default reorder-window byte budget (see `MAX_REORDER_BYTES`).
+fn default_reorder_window() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_listen_ip() -> std::net::IpAddr {
@@ -105,6 +120,11 @@ impl SplitterConfig {
             self.data_send_timeout_secs,
         )?;
         validate_secs("splitter.heartbeat_secs", self.heartbeat_secs)?;
+        validate_reorder_window(
+            "splitter.reorder_window_bytes",
+            self.reorder_window_bytes,
+            self.chunk_size as u64,
+        )?;
         Ok(())
     }
 }
@@ -124,8 +144,25 @@ impl ReassemblerConfig {
             self.data_send_timeout_secs,
         )?;
         validate_secs("reassembler.heartbeat_secs", self.heartbeat_secs)?;
+        validate_reorder_window(
+            "reassembler.reorder_window_bytes",
+            self.reorder_window_bytes,
+            self.chunk_size as u64,
+        )?;
         Ok(())
     }
+}
+
+/// B58: a window smaller than one chunk means every out-of-order frame
+/// overflows (instant reset); 1 GB is the sanity cap.
+fn validate_reorder_window(name: &str, bytes: u64, chunk_size: u64) -> Result<()> {
+    if bytes < chunk_size {
+        bail!("{name} must be >= chunk_size ({chunk_size} bytes), got {bytes}");
+    }
+    if bytes > 1024 * 1024 * 1024 {
+        bail!("{name} must be <= 1 GiB, got {bytes}");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -328,6 +365,51 @@ tunnel = []
         )
         .unwrap();
         cfg.splitter.unwrap().validate().unwrap();
+    }
+
+    /// B58: the reorder window defaults to 64 MB and must at least hold
+    /// one chunk (a smaller window overflows on the first out-of-order
+    /// frame and resets every connection).
+    #[test]
+    fn reorder_window_defaults_and_validation() {
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+tunnel = []
+"#,
+        )
+        .unwrap();
+        let sc = cfg.splitter.unwrap();
+        assert_eq!(sc.reorder_window_bytes, 64 * 1024 * 1024);
+        sc.validate().unwrap();
+
+        // Window smaller than the default chunk → rejected.
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+reorder_window_bytes = 65534
+tunnel = []
+"#,
+        )
+        .unwrap();
+        assert!(cfg.splitter.unwrap().validate().is_err());
+
+        // Sanity cap: > 1 GiB rejected.
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+reorder_window_bytes = 2147483648
+tunnel = []
+"#,
+        )
+        .unwrap();
+        assert!(cfg.splitter.unwrap().validate().is_err());
     }
 
     /// O5: the new timeout fields default and parse from TOML.

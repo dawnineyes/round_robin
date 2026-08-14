@@ -1,4 +1,4 @@
-use crate::frame::{MAX_REORDER_BYTES, MAX_REORDER_WINDOW};
+use crate::frame::{MAX_PAYLOAD, MAX_REORDER_BYTES, MAX_REORDER_WINDOW};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
@@ -19,21 +19,39 @@ pub struct PushResult {
 /// Reorder buffer: buffers out-of-order chunks and delivers them in
 /// sequence order once gaps are filled.
 ///
-/// The window is bounded both by entry count (`MAX_REORDER_WINDOW`) and
-/// by total buffered bytes (`MAX_REORDER_BYTES`, BUG-8 fix: 512 × 64 KB
-/// = 32 MB per connection was too much).
+/// The window is bounded both by entry count and by total buffered
+/// bytes.  The byte budget is configurable (B58: it must cover the
+/// sender's in-flight window — tunnels × 128 frames × chunk_size — or
+/// latency skew between tunnels overflows the window and resets the
+/// connection mid-transfer).
 pub struct ReorderBuf {
     expected: u64,
     pending: BTreeMap<u64, Bytes>,
     pending_bytes: usize,
+    /// Per-connection byte budget (B58, default `MAX_REORDER_BYTES`).
+    max_bytes: usize,
+    /// Entry cap: `max_bytes / MAX_PAYLOAD`, floored at
+    /// `MAX_REORDER_WINDOW` — bounds BTreeMap node count for pathological
+    /// tiny frames while never binding before the byte budget for
+    /// full-size frames.
+    max_entries: usize,
 }
 
 impl ReorderBuf {
+    /// Default window: `MAX_REORDER_BYTES` (64 MB — covers 8 tunnels of
+    /// full in-flight skew at the default chunk size).
     pub fn new() -> Self {
+        Self::with_limit(MAX_REORDER_BYTES)
+    }
+
+    /// B58: explicit window budget (config `reorder_window_bytes`).
+    pub fn with_limit(max_bytes: usize) -> Self {
         Self {
             expected: 1,
             pending: BTreeMap::new(),
             pending_bytes: 0,
+            max_bytes,
+            max_entries: (max_bytes / MAX_PAYLOAD).max(MAX_REORDER_WINDOW),
         }
     }
 
@@ -73,8 +91,8 @@ impl ReorderBuf {
             // the new payload's bytes without subtracting the old ones —
             // every duplicate leaked byte budget and could trip the
             // overflow reset early.
-            let can_buffer = self.pending.len() < MAX_REORDER_WINDOW
-                && self.pending_bytes + payload.len() <= MAX_REORDER_BYTES;
+            let can_buffer = self.pending.len() < self.max_entries
+                && self.pending_bytes + payload.len() <= self.max_bytes;
             match self.pending.entry(seq) {
                 std::collections::btree_map::Entry::Vacant(e) if can_buffer => {
                     self.pending_bytes += payload.len();
@@ -128,7 +146,9 @@ mod tests {
 
     #[test]
     fn overflow_and_completion() {
-        let mut buf = ReorderBuf::new();
+        // 8 MB limit → entry cap stays at the 512 floor (8 MB / 64 KB =
+        // 128 < 512), preserving the classic window-full behavior.
+        let mut buf = ReorderBuf::with_limit(8 * 1024 * 1024);
         // 512 pending frames fill the window; the next one overflows.
         for s in 2..(MAX_REORDER_WINDOW as u64 + 3) {
             buf.push(s, Bytes::from_static(b"x"));
@@ -153,9 +173,9 @@ mod tests {
 
     #[test]
     fn byte_budget_bounds_window() {
-        // BUG-8: with 64 KB chunks the byte budget (8 MB) must kick in
-        // long before the 512-entry cap.
-        let mut buf = ReorderBuf::new();
+        // BUG-8 semantics with an explicit 8 MB limit: with 64 KB chunks
+        // the byte budget kicks in long before the 512-entry cap.
+        let mut buf = ReorderBuf::with_limit(8 * 1024 * 1024);
         let chunk = Bytes::from(vec![0u8; 64 * 1024]);
         let mut accepted = 0;
         for s in 2..(MAX_REORDER_WINDOW as u64 + 2) {
@@ -166,8 +186,8 @@ mod tests {
             }
         }
         // 8 MB / 64 KB = 128 frames; far below the 512-entry cap.
-        assert_eq!(accepted, MAX_REORDER_BYTES / (64 * 1024));
-        assert_eq!(buf.pending_bytes(), MAX_REORDER_BYTES);
+        assert_eq!(accepted, (8 * 1024 * 1024) / (64 * 1024));
+        assert_eq!(buf.pending_bytes(), 8 * 1024 * 1024);
         // Next frame overflows (signals reset) instead of being queued.
         let overflow = buf.push(1_000_000, chunk.clone());
         assert!(overflow.overflow && !overflow.accepted);
@@ -176,6 +196,30 @@ mod tests {
         let ready = buf.push(1, Bytes::from_static(b"z"));
         assert!(ready.accepted);
         assert_eq!(ready.ready.len(), accepted + 1);
+        assert_eq!(buf.pending_bytes(), 0);
+    }
+
+    /// B58 regression: the DEFAULT window must tolerate the full
+    /// in-flight skew of 4 tunnels (4 × 128 frames × 64 KB = 32 MB).
+    /// The old fixed 8 MB cap overflowed at ~1/4 of that and reset every
+    /// large download on latency-skewed tunnels.
+    #[test]
+    fn default_window_tolerates_four_tunnel_skew() {
+        let mut buf = ReorderBuf::new();
+        let chunk = Bytes::from(vec![0u8; 64 * 1024]);
+        // 512 out-of-order frames = 32 MB = 4 tunnels' full in-flight.
+        let mut accepted = 0;
+        for s in 2..(MAX_REORDER_WINDOW as u64 + 2) {
+            assert!(
+                buf.push(s, chunk.clone()).accepted,
+                "frame {s} must be accepted by the default window"
+            );
+            accepted += 1;
+        }
+        assert_eq!(accepted, MAX_REORDER_WINDOW);
+        // Delivering the gap frame drains all 32 MB in order.
+        let ready = buf.push(1, Bytes::from_static(b"z"));
+        assert_eq!(ready.ready.len(), MAX_REORDER_WINDOW + 1);
         assert_eq!(buf.pending_bytes(), 0);
     }
 

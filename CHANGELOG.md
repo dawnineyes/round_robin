@@ -6,6 +6,38 @@
 
 ---
 
+## Phase 19: 重排窗口溢出修复（v1.10.14）
+
+> **基线**: v1.10.13
+> **来源**: 线上故障——4 条 TUIC 隧道下每个大文件下载必失败。日志定位：`reorder/channel overflow, resetting connection`（seq ~750-1250，传输 20-40MB 后）+ 数百帧 "late DATA on TIME_WAIT — possible data loss"。
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/frame.rs` | `MAX_REORDER_BYTES` 8MB → 64MB（新默认窗口预算，注释重写为 B58 语义） | B58 |
+| `src/reorder.rs` | `ReorderBuf` 增加 `max_bytes`/`max_entries` 字段与 `with_limit()`；条目上限按 `max_bytes / MAX_PAYLOAD`（下限 512）推导，字节预算不足一个 chunk 的窗口不再可能；新增 B58 回归测试（默认窗口容纳 4 隧道 32MB 全在途倾斜） | B58 |
+| `src/config.rs` | splitter/reassembler 增加 `reorder_window_bytes`（默认 64MB，serde default）+ 校验（≥ chunk_size、≤ 1GiB）+ 单测 | B58 |
+| `src/splitter.rs` / `src/reassembler.rs` | 配置贯通 `SplitterConfig`/`ClientCtx`/`ReassemblerConfig`/`ListenerCtx`/`ReadLoopCtx` → 两侧 VirtConn 构造用 `with_limit` | B58 |
+| `src/main.rs` | 新配置传入两侧 Config | B58 |
+| `tests/e2e.rs` | 全部配置构造点补新字段 | 编译 |
+| `config.example.toml` / `config.reassembler.example.toml` / `README.md` | `reorder_window_bytes` 文档（含"必须 ≥ 隧道数 × 128 × chunk_size"的选型公式） | B58 |
+| `Cargo.toml` | 版本 1.10.13 → 1.10.14 | 发布 |
+
+### 行为变化
+
+- **B58 修复**: 重排窗口默认预算 8MB → 64MB 且可配置。旧 8MB 远小于发送端在途窗口（4 隧道 × 128 帧 × 64KB = 32MB），隧道间延迟差稍大即溢出窗口并重置连接——大文件下载必断（Intel 镜像站 20-40MB 处，日志 seq 750-1250 与 8MB/64KB=128 帧倾斜完全吻合）。新默认覆盖 8 条隧道的全在途倾斜；条目上限随字节预算推导，小分片场景不失控
+- **配置**: `reorder_window_bytes` 两侧可配（默认 67108864）；校验拒绝小于一个 chunk 的窗口（否则首个乱序帧即溢出重置）
+
+### 测试结果
+
+- `cargo test`: 58/58 单元测试（新增 `default_window_tolerates_four_tunnel_skew`、`reorder_window_defaults_and_validation`；重写 `overflow_and_completion`/`byte_budget_bounds_window` 为显式 8MB 限额）+ 5/5 e2e 集成测试通过
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 18: 第七轮 Bug 审查修复（v1.10.13）
 
 > **基线**: v1.10.12

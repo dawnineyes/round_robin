@@ -69,6 +69,7 @@ local_target = "127.0.0.1:52040"
 | `chunk_size` | usize | 分片大小 512-65535，默认 65535 |
 | `data_send_timeout_secs` | u64 | DATA 发送超时（秒），超时即重置连接，默认 30 |
 | `heartbeat_secs` | u64 | 心跳/连接清扫间隔（秒），默认 60 |
+| `reorder_window_bytes` | u64 | 每连接重排窗口字节预算，默认 64MB——必须 ≥ 隧道数 × 128 × chunk_size（4 隧道默认分片 = 32MB），否则隧道延迟差会把窗口撑爆并重置下载连接 |
 | `[[splitter.tunnel]]` | array | 隧道列表 |
 | `tunnel.proxy` | SocketAddr | sing-box SOCKS5 入站地址 |
 | `tunnel.target` | String | Reassembler IP |
@@ -84,6 +85,7 @@ local_target = "127.0.0.1:52040"
 | `chunk_size` | usize | 分片大小，默认 65535 |
 | `data_send_timeout_secs` | u64 | DATA 发送超时（秒），默认 30 |
 | `heartbeat_secs` | u64 | 心跳/连接清扫间隔（秒），默认 60 |
+| `reorder_window_bytes` | u64 | 每连接重排窗口字节预算，默认 64MB（上传方向同样受此约束） |
 
 ## 协议
 

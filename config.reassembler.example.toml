@@ -11,3 +11,4 @@ local_target = "127.0.0.1:52040"  # 重组后出站目标（sing-box SOCKS5 入�
 chunk_size = 65535
 # data_send_timeout_secs = 30  # DATA 发送超时（秒），超时即重置连接，默认 30
 # heartbeat_secs = 60          # 心跳/连接清扫间隔（秒），默认 60
+# reorder_window_bytes = 67108864  # 每连接重排窗口字节预算，默认 64MB

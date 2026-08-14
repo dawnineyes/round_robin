@@ -31,6 +31,10 @@ pub struct ReassemblerConfig {
     /// Heartbeat / connection-sweep interval (O5: previously hardcoded
     /// 60s; configurable so tests can exercise sweeps without waiting).
     pub heartbeat_interval: Duration,
+    /// B58: per-connection reorder-window byte budget (configurable via
+    /// `reorder_window_bytes`; uploads flow this direction, same
+    /// in-flight math as the splitter's).
+    pub reorder_window_bytes: usize,
 }
 
 // ── Tuning constants ──────────────────────────────────────────────────
@@ -217,6 +221,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             pool,
             chunk_size: cfg.chunk_size,
             data_send_timeout: cfg.data_send_timeout,
+            reorder_window_bytes: cfg.reorder_window_bytes,
             pending_bytes,
             resets,
             syn_limit,
@@ -413,6 +418,8 @@ struct ListenerCtx {
     chunk_size: usize,
     /// O5: per-connection DATA send timeout (configurable).
     data_send_timeout: Duration,
+    /// B58: per-connection reorder-window byte budget.
+    reorder_window_bytes: usize,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
     /// B46: bounds concurrent spawned SYN handshakes.
@@ -495,6 +502,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             local_target: ctx.local_target,
             chunk_size: ctx.chunk_size,
             data_send_timeout: ctx.data_send_timeout,
+            reorder_window_bytes: ctx.reorder_window_bytes,
             pending_bytes: ctx.pending_bytes.clone(),
             resets: ctx.resets.clone(),
             link: link.clone(),
@@ -532,6 +540,8 @@ struct ReadLoopCtx {
     chunk_size: usize,
     /// O5: per-connection DATA send timeout (configurable).
     data_send_timeout: Duration,
+    /// B58: per-connection reorder-window byte budget.
+    reorder_window_bytes: usize,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
     link: Arc<TunnelLink>,
@@ -701,7 +711,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
             };
             let vconn = Arc::new(VirtConnDe {
                 egress: None, // O7: UDP datagrams bypass the egress channel
-                reorder: Mutex::new(ReorderBuf::new()),
+                reorder: Mutex::new(ReorderBuf::with_limit(ctx.reorder_window_bytes)),
                 cancel: cancel.clone(),
                 cancel_writer: cancel_writer.clone(),
                 half_close: half_close.clone(),
@@ -889,7 +899,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
 
         let vconn = Arc::new(VirtConnDe {
             egress: Some(EgressConn { write_tx }),
-            reorder: Mutex::new(ReorderBuf::new()),
+            reorder: Mutex::new(ReorderBuf::with_limit(ctx.reorder_window_bytes)),
             cancel: cancel.clone(),
             cancel_writer: cancel_writer.clone(),
             half_close: half_close.clone(),
@@ -1771,6 +1781,7 @@ mod tests {
             local_target: "127.0.0.1:9".parse().unwrap(),
             chunk_size: 4096,
             data_send_timeout: Duration::from_secs(30),
+            reorder_window_bytes: crate::frame::MAX_REORDER_BYTES,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicU64::new(0)),
             link,

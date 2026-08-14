@@ -363,6 +363,7 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -392,6 +393,7 @@ async fn tcp_e2e_ordered_delivery_with_slow_tunnel() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -456,6 +458,7 @@ async fn tunnel_death_resets_affected_connection_fast() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -478,6 +481,7 @@ async fn tunnel_death_resets_affected_connection_fast() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -560,6 +564,7 @@ async fn client_disconnect_propagates_teardown() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -578,6 +583,7 @@ async fn client_disconnect_propagates_teardown() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -667,6 +673,7 @@ async fn client_keeps_sending_after_remote_fin() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -688,6 +695,7 @@ async fn client_keeps_sending_after_remote_fin() {
             // the client is still sending — pre-fix, the first sweep
             // after the FIN killed the conn and truncated the tail.
             heartbeat_interval: Duration::from_secs(2),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;
@@ -759,6 +767,7 @@ async fn udp_e2e_two_clients_relay_concurrently() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = reassembler::run_reassembler(reassembler_cfg).await;
@@ -777,6 +786,7 @@ async fn udp_e2e_two_clients_relay_concurrently() {
             chunk_size: CHUNK,
             data_send_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(60),
+            reorder_window_bytes: 64 * 1024 * 1024,
         };
         tokio::spawn(async move {
             let _ = splitter::run_splitter(splitter_cfg).await;

@@ -28,6 +28,10 @@ pub struct SplitterConfig {
     /// DATA send timeout (O5: configurable via `data_send_timeout_secs`;
     /// default 30s, previously the DATA_SEND_TIMEOUT constant).
     pub data_send_timeout: Duration,
+    /// B58: per-connection reorder-window byte budget (configurable via
+    /// `reorder_window_bytes`; default 64 MB — must cover the tunnels'
+    /// in-flight window or skew overflows it mid-transfer).
+    pub reorder_window_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -464,6 +468,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 time_wait: time_wait.clone(),
                 chunk_size: cfg.chunk_size,
                 data_send_timeout: cfg.data_send_timeout,
+                reorder_window_bytes: cfg.reorder_window_bytes,
                 udp_sent: us,
                 udp_recv: ur,
                 half_open,
@@ -652,6 +657,8 @@ struct ClientCtx {
     chunk_size: usize,
     /// O5: per-connection DATA send timeout (configurable).
     data_send_timeout: Duration,
+    /// B58: per-connection reorder-window byte budget.
+    reorder_window_bytes: usize,
     udp_sent: Arc<AtomicU64>,
     udp_recv: Arc<AtomicU64>,
     half_open: Arc<AtomicUsize>,
@@ -743,7 +750,7 @@ async fn handle_tcp_client(
     let (to_client_tx, to_client_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_CAP);
     let vconn = Arc::new(VirtConn {
         to_client_tx,
-        reorder: Mutex::new(ReorderBuf::new()),
+        reorder: Mutex::new(ReorderBuf::with_limit(ctx.reorder_window_bytes)),
         notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         fin_received: AtomicBool::new(false),
@@ -961,7 +968,7 @@ async fn handle_udp_client(
     let (to_udp_tx, mut to_udp_rx) = mpsc::channel::<Bytes>(UDP_CHANNEL_CAP);
     let vconn = Arc::new(VirtConn {
         to_client_tx: to_udp_tx,
-        reorder: Mutex::new(ReorderBuf::new()),
+        reorder: Mutex::new(ReorderBuf::with_limit(ctx.reorder_window_bytes)),
         notify: tokio::sync::Notify::new(),
         closed: AtomicBool::new(false),
         fin_received: AtomicBool::new(false),

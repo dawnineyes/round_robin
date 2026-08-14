@@ -85,6 +85,8 @@ async fn main() -> Result<()> {
                 // O5: both timeouts are configurable now (30s/60s defaults).
                 data_send_timeout: std::time::Duration::from_secs(sc.data_send_timeout_secs),
                 heartbeat_interval: std::time::Duration::from_secs(sc.heartbeat_secs),
+                // B58: reorder window must cover the tunnels' in-flight.
+                reorder_window_bytes: sc.reorder_window_bytes as usize,
             })
             .await
         }
@@ -103,6 +105,8 @@ async fn main() -> Result<()> {
                 // O5: configurable timeouts (30s/60s defaults).
                 data_send_timeout: std::time::Duration::from_secs(rc.data_send_timeout_secs),
                 heartbeat_interval: std::time::Duration::from_secs(rc.heartbeat_secs),
+                // B58: see the splitter branch.
+                reorder_window_bytes: rc.reorder_window_bytes as usize,
             })
             .await
         }

@@ -21,12 +21,16 @@ pub const MAX_PAYLOAD: usize = 65535;
 pub const MIN_CHUNK: usize = 512;
 pub const MAX_CHUNK: usize = 65535;
 
-/// Max out-of-order entries before new arrivals are dropped.
+/// Floor for the out-of-order entry cap (see `ReorderBuf::with_limit`).
 pub const MAX_REORDER_WINDOW: usize = 512;
-/// BUG-8 fix: byte budget for the reorder window, independent of frame
-/// count. 512 frames × 64 KB = 32 MB/connection was too much; 8 MB caps
-/// memory while keeping the window large enough for high-BDP tunnels.
-pub const MAX_REORDER_BYTES: usize = 8 * 1024 * 1024;
+/// Default per-connection reorder-window byte budget.  B58: the old 8 MB
+/// cap was far below the sender's in-flight window (tunnels × 128 frames
+/// × chunk_size = 32 MB with 4 tunnels at the default 64 KB chunk) — any
+/// latency skew larger than ~8 MB overflowed the window and reset the
+/// connection mid-transfer (every large download died).  64 MB covers
+/// 8 tunnels of full in-flight skew; configurable per side via
+/// `reorder_window_bytes`.
+pub const MAX_REORDER_BYTES: usize = 64 * 1024 * 1024;
 /// Max number of pending CIDs with DATA-before-SYN buffered (reassembler).
 pub const MAX_PENDING_CIDS: usize = 256;
 /// BUG-7 fix: global byte budget for pending DATA-before-SYN frames.
