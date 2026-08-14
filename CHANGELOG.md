@@ -6,6 +6,42 @@
 
 ---
 
+## Phase 14: 加权 DATA 调度器（v1.10.9）
+
+> **基线**: v1.10.8
+> **动机**: 原 `send_async` 采用 least-loaded（选队列空位最多的隧道）。在"低延迟但被运营商限速"的隧道场景下，该策略失明：限速不表现为本地队列积压（数据先被 TCP 内核缓冲吸收），快隧道持续垄断流量，限速隧道与其他健康隧道都被喂错比例，总吞吐被拖到限速隧道水平，且被冷落的隧道拥塞窗口萎缩。
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/tunnel.rs` | `TunnelLink` 新增 `rate_bps`（f64 bits，drain 任务唯一写者）；`drain_frames` 在每次成功写出后按写间隔维护时间衰减 EWMA（τ=2.5s，纯函数 `ewma_rate`）；`send_async` 改为加权选择：锚点网格确定性加权轮询（`weighted_pick`），权重=EWMA 速率（未测量=乐观均值，全体未知=均匀），每链路保底份额 `FLOOR_SHARE=5%`；队列满的链路本轮跳过（try_send 失败即重选），全部饱和时回退阻塞在最高权重链路；新增 7 个单测 | 调度器 |
+| `src/splitter.rs` / `src/reassembler.rs` | `TunnelLink` 构造点补 `rate_bps` 字段 | 编译 |
+| `Cargo.toml` | 版本 1.10.8 → 1.10.9 | 发布 |
+
+### 行为变化
+
+- **限速自适应**: 被限速的隧道被过量喂入时，drain 写被传输层背压卡住 → 写间隔拉长 → EWMA 速率收敛到该隧道真实容量 → 权重自动下调，流量分流到健康隧道；隧道恢复后权重自动回升（保底份额保证其始终获得探测流量）
+- **无饿死**: 每链路至少 5% 权重份额；完全未测量的新隧道按均值乐观赋权，加入即被探测
+- **不阻塞快路径**: 加权选中的链路队列满时立即重选（权重在未饱和链路间重新归一化），单帧不再被慢隧道拖住；只有全部链路饱和才回退阻塞（真背压语义不变）
+- **分布确定**: 锚点网格游标使选路确定可复现（1024 次选择精确符合权重比例），便于测试与观测
+- **保持不变的语义**: `send`（SYN/FIN/RST 控制帧）仍为轮询 try_send；调用方 `DATA_SEND_TIMEOUT` 包裹不变；`send_async` 返回值语义（是否有活链路收下）不变
+
+### 测试结果
+
+- `cargo test`: 37/37 单元测试 + 4/4 e2e 集成测试通过（新增 7 个：`ewma_decays_and_converges`、`weighted_pick_distributes_by_rate`、`weighted_pick_floor_guarantees_share`、`weighted_pick_optimistic_for_unmeasured`、`weighted_pick_cold_start_uniform`、`send_async_skips_full_link`、`send_async_blocks_when_all_full`）
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --release`: 见发布流程
+
+### 已知限制
+
+- 权重测量点是 drain 写速率（无应用层 ACK），限速检测延迟 ≈ 内核缓冲填满时间 + EWMA 时间常数（τ=2.5s），无法消除但可接受
+- 未饱和链路的测量值等于其喂入速率而非容量——保底份额保证最低喂入，需求超过总容量时全部链路进入背压、测量值收敛到容量比例
+- 若运营商按账号/出口聚合限速（3 条共享同一限速池），任何选路策略均无效
+
+---
+
 ## Phase 13: 第三轮 Bug 审查修复（v1.10.8）
 
 > **基线**: v1.10.7

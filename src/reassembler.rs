@@ -385,6 +385,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
+            rate_bps: AtomicU64::new(0),
         });
         ctx.pool.add(link.clone());
 
@@ -1420,6 +1421,7 @@ mod tests {
             frames_recv: AtomicU64::new(0),
             stop: Arc::new(Notify::new()),
             lost_frames: Mutex::new(Vec::new()),
+            rate_bps: AtomicU64::new(0),
         });
         let pool = Arc::new(TunnelPool::new());
         pool.add(link.clone());

@@ -201,6 +201,7 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                             frames_recv: AtomicU64::new(0),
                             stop: Arc::new(tokio::sync::Notify::new()),
                             lost_frames: Mutex::new(Vec::new()),
+                            rate_bps: AtomicU64::new(0),
                         });
                         pool.add(link.clone());
 
