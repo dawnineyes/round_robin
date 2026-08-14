@@ -6,6 +6,38 @@
 
 ---
 
+## Phase 15: 第四轮 Bug 审查修复（v1.10.10）
+
+> **基线**: v1.10.9
+> **来源**: `BUG_REVIEW_v1109.md`（B41–B45）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/tunnel.rs` | `TunnelPool` 新增 `added: Notify`（`add()` 时 `notify_waiters`）；`send_async` 在"无任何活链路"时等待新链路加入而非立即返回 false（调用方 `DATA_SEND_TIMEOUT` 30s 兜底）；更新 2 个旧单测（超时包裹）+ 新增 `send_async_waits_for_new_link` 回归单测 | B45 |
+| `src/reassembler.rs` | SYN 处理器的 egress 连接失败/超时两分支补 `closed` 墓碑（与其余 SYN 失败路径对齐，新增单测）；`read_from_egress` 发送失败时 fail-fast（墓碑 + 移除 conn + 尽力 RST）替代"FIN 送入永远填不上的 seq 空洞"流程，FIN 发送失败补 RST 兜底，发送超时经 `EgressReaderCtx.data_send_timeout` 注入（可测），统计改为直接用任务持有的 `vconn` Arc（省去每块一次 DashMap 查找）；新增 `dispatch_frame`：SYN 帧在带 `Semaphore` 上限（64）的并发任务中处理，egress connect（≤10s）不再头部阻塞隧道读循环（上限耗尽时降级为内联处理），`ReadLoopCtx`/`ListenerCtx` 派生 Clone 并携带 `syn_limit`；新增 3 个回归单测 | B41/B42/B46 |
+| `src/splitter.rs` | `handle_client` 分配的 conn_id 直接传入 `handle_udp_client`（删除重复分配）；UDP keepalive 监听任务保存句柄，中继先结束时 `abort`（心跳清扫/RST 后不再泄漏任务与控制 TCP 连接） | B43/B44 |
+| `Cargo.toml` | 版本 1.10.9 → 1.10.10 | 发布 |
+
+### 行为变化
+
+- **B45 修复**: 全部隧道同时短暂中断（如网络抖动导致的重连 3s 窗口）不再瞬间判死所有在途连接——`send_async` 等待链路回归（有界于调用方 30s 超时），短暂抖动不再截断所有传输；真故障仍按原 30s 语义失败
+- **B42 修复**: egress 响应发送失败（30s 无活隧道）时立即拆除双方连接 + 尽力 RST，客户端快速失败而非挂起至 60s 静默超时；FIN 无法送达时补 RST 兜底，隧道恢复后客户端即时感知连接已断
+- **B41 修复**: egress 连接失败/超时的 cid 写 closed 墓碑，迟到的 DATA 帧立即收到确定性 RST，不再生成僵尸 pending 条目（30s 内占用字节预算并可逐出健康条目）
+- **B43 清理**: UDP 关联复用握手完成后分配的 conn_id，删除一次无用的随机分配
+- **B44 修复**: UDP 中继被心跳清扫/重置后，keepalive 监听任务立即中止，控制 TCP 连接随即关闭（原实现任务与 socket 存活至客户端主动关闭）
+- **B46 修复**: SYN 握手（egress connect ≤10s）不再阻塞所在隧道读循环——同隧道其他连接的帧即时处理；SYN 并发以 64 个信号量限流，SYN 洪泛时自动降级为原内联行为
+
+### 测试结果
+
+- `cargo test`: 41/41 单元测试 + 4/4 e2e 集成测试通过（新增 4 个：`syn_connect_failure_tombstones_cid`、`egress_send_failure_resets_conn`、`send_async_waits_for_new_link`、`syn_connect_stall_does_not_block_other_cids`）
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 14: 加权 DATA 调度器（v1.10.9）
 
 > **基线**: v1.10.8

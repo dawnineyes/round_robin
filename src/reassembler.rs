@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tracing::{error, info, warn};
 
 // ── Config ────────────────────────────────────────────────────────────
@@ -48,6 +48,10 @@ const MAX_TUNNEL_LINKS: usize = 64;
 /// B29: handshaking flags outlive any possible SYN handshake (egress
 /// connect timeout is 10s) — sweep entries older than this.
 const HANDSHAKING_TTL: Duration = Duration::from_secs(120);
+/// B46: cap concurrent SYN handshakes spawned off the tunnel read loops.
+/// Each holds an egress connect (≤10s); the cap bounds tasks + sockets
+/// under a SYN flood, and at cap the SYN is handled inline (old behavior).
+const MAX_CONCURRENT_SYN_HANDSHAKES: usize = 64;
 
 // ── Egress connection ─────────────────────────────────────────────────
 
@@ -149,6 +153,8 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
     let pending_bytes: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     // Connection reset counter (observability: logged by the heartbeat).
     let resets: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // B46: bound concurrent SYN handshakes spawned off the tunnel loops.
+    let syn_limit: Arc<Semaphore> = Arc::new(Semaphore::new(MAX_CONCURRENT_SYN_HANDSHAKES));
 
     // B28: the legacy conn-0 single-client UDP relay was removed — every
     // UDP association gets its own conn_id + socket pair (BUG-19 design).
@@ -164,6 +170,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
         let listen_ip = cfg.listen_ip;
         let pending_bytes = pending_bytes.clone();
         let resets = resets.clone();
+        let syn_limit = syn_limit.clone();
         let lctx = ListenerCtx {
             listen_ip,
             local_target,
@@ -175,6 +182,7 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
             chunk_size: cfg.chunk_size,
             pending_bytes,
             resets,
+            syn_limit,
         };
         tokio::spawn(async move {
             if let Err(e) = run_tunnel_listener(port, lctx).await {
@@ -341,6 +349,8 @@ struct ListenerCtx {
     chunk_size: usize,
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
+    /// B46: bounds concurrent spawned SYN handshakes.
+    syn_limit: Arc<Semaphore>,
 }
 
 async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
@@ -419,6 +429,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
             pending_bytes: ctx.pending_bytes.clone(),
             resets: ctx.resets.clone(),
             link: link.clone(),
+            syn_limit: ctx.syn_limit.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = tunnel_read_loop(rd, reader_ctx).await {
@@ -441,6 +452,7 @@ async fn run_tunnel_listener(port: u16, ctx: ListenerCtx) -> Result<()> {
     }
 }
 
+#[derive(Clone)]
 struct ReadLoopCtx {
     conns: ConnMap,
     pending: PendingMap,
@@ -452,6 +464,8 @@ struct ReadLoopCtx {
     pending_bytes: Arc<AtomicUsize>,
     resets: Arc<AtomicU64>,
     link: Arc<TunnelLink>,
+    /// B46: bounds concurrent spawned SYN handshakes.
+    syn_limit: Arc<Semaphore>,
 }
 
 async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopCtx) -> Result<()> {
@@ -462,10 +476,43 @@ async fn tunnel_read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: ReadLoopC
             None => return Ok(()),
         };
         let plen = frame.payload.len() as u64;
-        handle_frame(frame, &ctx).await?;
+        dispatch_frame(frame, &ctx).await?;
         ctx.link.bytes_recv.fetch_add(plen, Ordering::Relaxed);
         ctx.link.frames_recv.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// B46: dispatch a decoded frame to its handler.  SYN frames are handled
+/// on a bounded concurrent task — the egress connect inside can stall up
+/// to 10s, and handling it inline used to head-of-line block this
+/// tunnel's read loop (every other conn on the tunnel waited behind it).
+/// DATA/FIN/RST handlers are cheap and stay inline (per-cid ordering is
+/// preserved by the pending/reorder machinery either way — that same
+/// machinery already tolerates SYN vs DATA racing across tunnels).
+/// handle_frame never returns an error, so swallowing it in the spawned
+/// task is safe.
+async fn dispatch_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
+    if frame.flags & FLAG_SYN != 0 {
+        match ctx.syn_limit.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let ctx2 = ctx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = handle_frame(frame, &ctx2).await;
+                });
+                return Ok(());
+            }
+            Err(_) => {
+                // SYN flood — degrade to inline handling (old behavior)
+                // rather than dropping the connection.
+                warn!(
+                    conn_id = frame.conn_id,
+                    "SYN handshake limit reached, handling inline"
+                );
+            }
+        }
+    }
+    handle_frame(frame, ctx).await
 }
 
 // ── Frame handler ─────────────────────────────────────────────────────
@@ -702,6 +749,12 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     warn!(conn_id = cid, target = %syn_target.address, error = %e, "egress connect failed");
                     remove_pending(ctx, &cid);
                     ctx.handshaking.remove(&cid);
+                    // B41: tombstone like every other SYN failure path —
+                    // without it, late DATA frames for this cid (still in
+                    // flight on other tunnels) would create a zombie
+                    // pending entry that eats the byte budget for 30s and
+                    // can evict healthy entries before the TTL sweep.
+                    ctx.closed.insert(cid, Instant::now());
                     ctx.pool.send(Frame::rst(cid));
                     return Ok(());
                 }
@@ -709,6 +762,8 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     warn!(conn_id = cid, target = %syn_target.address, "egress connect timeout");
                     remove_pending(ctx, &cid);
                     ctx.handshaking.remove(&cid);
+                    // B41: see above.
+                    ctx.closed.insert(cid, Instant::now());
                     ctx.pool.send(Frame::rst(cid));
                     return Ok(());
                 }
@@ -779,6 +834,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 cancel,
                 closed: ctx.closed.clone(),
                 vconn: vconn.clone(),
+                data_send_timeout: DATA_SEND_TIMEOUT,
             },
         ));
 
@@ -1304,6 +1360,8 @@ struct EgressReaderCtx {
     cancel: Arc<Notify>,
     closed: Arc<DashMap<u32, Instant>>,
     vconn: Arc<VirtConnDe>,
+    /// DATA/FIN send timeout (injectable so tests don't wait 30s).
+    data_send_timeout: Duration,
 }
 
 async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressReaderCtx) {
@@ -1314,8 +1372,10 @@ async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressRea
     let cancel = ctx.cancel;
     let closed = ctx.closed;
     let vconn = ctx.vconn;
+    let data_send_timeout = ctx.data_send_timeout;
     let mut seq: u64 = 1;
     let mut cancelled = false;
+    let mut send_failed = false;
     // One reusable read buffer per connection; each frame copies exactly
     // n bytes into a fresh Bytes (no 64 KB backing per in-flight frame).
     let mut buf = vec![0u8; chunk_size];
@@ -1331,20 +1391,25 @@ async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressRea
                     Ok(n) => {
                         let frame = Frame::data(conn_id, seq, Bytes::copy_from_slice(&buf[..n]));
                         // Real backpressure: wait for a tunnel to take the
-                        // frame (bounded by DATA_SEND_TIMEOUT).
-                        let sent = tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(frame))
+                        // frame (bounded by data_send_timeout; B45 makes the
+                        // wait cover short tunnel-reconnect gaps).
+                        let sent = tokio::time::timeout(data_send_timeout, pool.send_async(frame))
                             .await
                             .unwrap_or(false);
                         if !sent {
                             warn!(conn_id, "no live tunnels for egress response after timeout");
+                            // B42: the response seq stream is permanently
+                            // broken (TCP tunnels never retransmit) — the
+                            // normal FIN flow would hand the splitter a
+                            // gap it can never fill.  Fail fast instead.
+                            send_failed = true;
                             break;
                         }
-                        // Count on the VirtConnDe
-                        if let Some(vconn) = conns.get(&conn_id) {
-                            vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
-                            vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
-                            *vconn.last_active.lock().unwrap() = Instant::now();
-                        }
+                        // Count on the VirtConnDe — the task already holds
+                        // the Arc, no DashMap lookup per chunk.
+                        vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                        vconn.frames_sent.fetch_add(1, Ordering::Relaxed);
+                        *vconn.last_active.lock().unwrap() = Instant::now();
                         seq = seq.wrapping_add(1);
                     }
                     Err(e) => {
@@ -1355,21 +1420,43 @@ async fn read_from_egress(mut rd: tokio::net::tcp::OwnedReadHalf, ctx: EgressRea
             }
         }
     }
-    if !cancelled {
-        // Echo FIN to the splitter. D3: do NOT tear the conn down —
-        // the splitter may still be sending data on the other direction.
-        // The conn is removed only once the splitter's FIN half-closes
-        // the egress write side as well (finish_if_done).
-        let fin_sent =
-            tokio::time::timeout(DATA_SEND_TIMEOUT, pool.send_async(Frame::fin(conn_id, seq)))
-                .await
-                .unwrap_or(false);
-        if !fin_sent {
-            warn!(conn_id, "failed to send FIN to splitter");
-        }
-        vconn.egress_eof.store(true, Ordering::Release);
-        finish_if_done(&vconn, conn_id, &conns, &closed);
+    if cancelled {
+        return; // teardown in progress elsewhere (RST / finish_if_done)
     }
+    if send_failed {
+        // B42: the splitter's client would otherwise hang until its 60s
+        // quiet timeout — reset both sides now.  Remove the conn and
+        // tombstone so late DATA from the splitter gets a deterministic
+        // RST; the best-effort RST below tears the client down promptly
+        // whenever any tunnel can carry it.
+        warn!(conn_id, "egress response send failed, resetting connection");
+        closed.insert(conn_id, Instant::now());
+        if let Some((_, vc)) = conns.remove(&conn_id) {
+            vc.cancel.notify_one();
+        }
+        pool.send(Frame::rst(conn_id));
+        return;
+    }
+    // Echo FIN to the splitter. D3: do NOT tear the conn down —
+    // the splitter may still be sending data on the other direction.
+    // The conn is removed only once the splitter's FIN half-closes
+    // the egress write side as well (finish_if_done).
+    let fin_sent =
+        tokio::time::timeout(data_send_timeout, pool.send_async(Frame::fin(conn_id, seq)))
+            .await
+            .unwrap_or(false);
+    if !fin_sent {
+        // B42: without a FIN the splitter's client hangs until its 60s
+        // quiet timeout — best-effort RST so it fails fast as soon as
+        // any tunnel can carry it.
+        warn!(
+            conn_id,
+            "failed to send FIN to splitter, sending RST fallback"
+        );
+        pool.send(Frame::rst(conn_id));
+    }
+    vconn.egress_eof.store(true, Ordering::Release);
+    finish_if_done(&vconn, conn_id, &conns, &closed);
 }
 
 /// Remove the conn (and tombstone its cid) once both directions are
@@ -1401,6 +1488,109 @@ fn finish_if_done(
             "closed"
         );
         drop(vc);
+    }
+}
+
+/// Mini SOCKS5 CONNECT proxy for the B46 test: reads greeting + request,
+/// stalls on the CONNECT until `release`, then connects to the target
+/// and reports success.  Rejects non-CONNECT commands.
+#[cfg(test)]
+async fn run_stalling_proxy(listener: TcpListener, release: Arc<Notify>) {
+    loop {
+        let (s, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let release = release.clone();
+        tokio::spawn(async move {
+            let mut s = s;
+            let mut hdr = [0u8; 2];
+            if s.read_exact(&mut hdr).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; hdr[1] as usize];
+            if s.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            if s.write_all(&[0x05, 0x00]).await.is_err() {
+                return;
+            }
+            let mut req = [0u8; 4];
+            if s.read_exact(&mut req).await.is_err() {
+                return;
+            }
+            if req[1] != 0x01 {
+                let _ = s
+                    .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                return;
+            }
+            // Read the address per ATYP (same layout as the e2e proxy).
+            let (host, port) = match req[3] {
+                0x01 => {
+                    let mut b = [0u8; 6];
+                    if s.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    (
+                        format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]),
+                        u16::from_be_bytes([b[4], b[5]]),
+                    )
+                }
+                0x03 => {
+                    let mut len = [0u8; 1];
+                    if s.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut b = vec![0u8; len[0] as usize];
+                    if s.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    let mut p = [0u8; 2];
+                    if s.read_exact(&mut p).await.is_err() {
+                        return;
+                    }
+                    (
+                        String::from_utf8_lossy(&b).into_owned(),
+                        u16::from_be_bytes(p),
+                    )
+                }
+                0x04 => {
+                    let mut b = [0u8; 18];
+                    if s.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    let segs: Vec<String> = b[..16]
+                        .chunks(2)
+                        .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+                        .collect();
+                    (segs.join(":"), u16::from_be_bytes([b[16], b[17]]))
+                }
+                _ => return,
+            };
+            // Stall until the test releases the connect.
+            release.notified().await;
+            // Keep the upstream connection alive for the rest of the test
+            // (`_up` binds it until the task ends).
+            let _up = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                Ok(u) => u,
+                Err(_) => {
+                    let _ = s
+                        .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                    return;
+                }
+            };
+            if s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Hold the connection open until the client side closes.
+            let mut b = [0u8; 1];
+            let _ = s.read(&mut b).await;
+        });
     }
 }
 
@@ -1436,8 +1626,33 @@ mod tests {
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicU64::new(0)),
             link,
+            syn_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_SYN_HANDSHAKES)),
         };
         (ctx, rx)
+    }
+
+    /// Helper: a VirtConnDe wired to a real egress channel (used by the
+    /// read_from_egress test).
+    fn make_vconn(_cid: u32) -> Arc<VirtConnDe> {
+        let (write_tx, _write_rx) = mpsc::channel::<Bytes>(EGRESS_CHANNEL_CAP);
+        Arc::new(VirtConnDe {
+            egress: EgressConn { write_tx },
+            reorder: Mutex::new(ReorderBuf::new()),
+            cancel: Arc::new(Notify::new()),
+            half_close: Arc::new(Notify::new()),
+            fin_received: AtomicBool::new(false),
+            fin_seq: AtomicU64::new(0),
+            half_close_state: AtomicU8::new(0),
+            is_udp: false,
+            udp_sock: None,
+            egress_eof: AtomicBool::new(false),
+            created_at: Instant::now(),
+            last_active: Mutex::new(Instant::now()),
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            frames_recv: AtomicU64::new(0),
+        })
     }
 
     /// B23 regression: pending DATA overflow must reset the connection
@@ -1569,5 +1784,145 @@ mod tests {
             ctx.closed.contains_key(&cid),
             "RST for unknown cid must tombstone"
         );
+    }
+
+    /// B41 regression: an egress connect failure must tombstone the cid
+    /// (like every other SYN failure path) — otherwise late DATA frames
+    /// still in flight on other tunnels create a zombie pending entry
+    /// that eats the byte budget for 30s and can evict healthy entries.
+    #[tokio::test]
+    async fn syn_connect_failure_tombstones_cid() {
+        let (ctx, mut rx) = make_ctx();
+        // make_ctx's local_target is 127.0.0.1:9 — nothing listens there,
+        // so the egress connect fails fast.
+        let cid = 1234u32;
+        let payload = SynTarget {
+            proto: PROTO_TCP,
+            address: "127.0.0.1".into(),
+            port: 9,
+        }
+        .encode()
+        .unwrap();
+        handle_frame(Frame::syn(cid, payload), &ctx).await.unwrap();
+        let got = rx.recv().await.expect("expected an RST on the pool");
+        assert_eq!(got.conn_id, cid);
+        assert_eq!(got.flags, FLAG_RST);
+        assert!(
+            ctx.closed.contains_key(&cid),
+            "connect-failed cid must be tombstoned"
+        );
+        assert!(!ctx.handshaking.contains_key(&cid));
+        assert!(!ctx.pending.contains_key(&cid));
+    }
+
+    /// B42 regression: when the egress response cannot be sent (no live
+    /// tunnel), read_from_egress must fail fast — tombstone + remove the
+    /// conn + best-effort RST — instead of the FIN flow, which would hand
+    /// the splitter a seq gap it can never fill (its client then hangs
+    /// until the 60s quiet timeout).
+    #[tokio::test]
+    async fn egress_send_failure_resets_conn() {
+        let (ctx, rx) = make_ctx();
+        drop(rx); // tunnel channel closed → the link dies on first try_send
+        let cid = 4242u32;
+        let vconn = make_vconn(cid);
+        ctx.conns.insert(cid, vconn.clone());
+
+        // Real TCP pair: the server half feeds the egress reader.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (rd, _wr) = server.into_split();
+
+        let task = tokio::spawn(read_from_egress(
+            rd,
+            EgressReaderCtx {
+                conn_id: cid,
+                conns: ctx.conns.clone(),
+                pool: ctx.pool.clone(),
+                chunk_size: 4096,
+                cancel: Arc::new(Notify::new()),
+                closed: ctx.closed.clone(),
+                vconn,
+                data_send_timeout: Duration::from_millis(100),
+            },
+        ));
+        // Feed response data — the send fails (no live tunnel) and the
+        // reader must tear the connection down.
+        peer.write_all(b"response-bytes").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("egress reader did not exit")
+            .unwrap();
+        assert!(ctx.closed.contains_key(&cid), "conn must be tombstoned");
+        assert!(
+            !ctx.conns.contains_key(&cid),
+            "conn must be removed from conns"
+        );
+        drop(peer);
+    }
+
+    /// B46 regression: a SYN whose egress connect stalls must NOT block
+    /// the tunnel read loop — frames for other cids keep flowing.  The
+    /// SYN handler runs on a spawned task (bounded by syn_limit).
+    #[tokio::test]
+    async fn syn_connect_stall_does_not_block_other_cids() {
+        let (mut ctx, _rx) = make_ctx();
+
+        // Target listener (accept and hold) so the proxy's connect
+        // succeeds once it is released.
+        let target_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = target_l.accept().await;
+        });
+
+        // Mini SOCKS5 proxy: completes greeting/auth, then stalls on the
+        // CONNECT request until released, then connects to the target.
+        let proxy_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_l.local_addr().unwrap();
+        let release = Arc::new(Notify::new());
+        tokio::spawn(run_stalling_proxy(proxy_l, release.clone()));
+        ctx.local_target = proxy_addr;
+
+        // SYN for cid A: dispatch returns immediately while the connect
+        // stalls inside the spawned handshake task.
+        let syn_a = Frame::syn(
+            1001,
+            SynTarget {
+                proto: PROTO_TCP,
+                address: "127.0.0.1".into(),
+                port: target_addr.port(),
+            }
+            .encode()
+            .unwrap(),
+        );
+        let t0 = Instant::now();
+        dispatch_frame(syn_a, &ctx).await.unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "SYN dispatch must not block on the egress connect"
+        );
+
+        // DATA for cid B is processed promptly — pending entry created
+        // without waiting for the stalled SYN.
+        dispatch_frame(Frame::data(2002, 1, Bytes::from_static(b"x")), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            ctx.pending.contains_key(&2002),
+            "other cid's DATA must be buffered while the SYN connect stalls"
+        );
+
+        // Release the connect — cid A's conn must appear promptly.
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ctx.conns.contains_key(&1001) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("conn A not established after connect release");
     }
 }

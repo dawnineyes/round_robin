@@ -675,7 +675,7 @@ async fn handle_client(stream: TcpStream, ctx: ClientCtx) -> Result<()> {
         socks5::Socks5Result::UdpAssociate {
             stream: keepalive,
             relay,
-        } => handle_udp_client(relay, keepalive, reply, &ctx).await,
+        } => handle_udp_client(conn_id, relay, keepalive, reply, &ctx).await,
     };
     ctx.conn_slot.notify_one();
     result
@@ -912,6 +912,7 @@ async fn handle_tcp_client(
 /// conn and announced via SYN proto=UDP) — multiple clients can relay
 /// concurrently instead of fighting over UDP_CONN_ID.
 async fn handle_udp_client(
+    conn_id: u32,
     relay: UdpSocket,
     keepalive: TcpStream,
     reply: Vec<u8>,
@@ -928,8 +929,6 @@ async fn handle_udp_client(
     } = ctx;
     let relay = Arc::new(relay);
     let relay_addr = relay.local_addr()?;
-    let conn_id = alloc_conn_id(conns, time_wait)
-        .ok_or_else(|| anyhow::anyhow!("conn_id space exhausted, cannot start UDP relay"))?;
     info!(conn_id, addr = %relay_addr, "UDP relay started");
 
     let (to_udp_tx, mut to_udp_rx) = mpsc::channel::<Bytes>(UDP_CHANNEL_CAP);
@@ -996,7 +995,7 @@ async fn handle_udp_client(
     // RFC 1928: UDP association is tied to the TCP control connection.
     // When the client closes it, tear down the relay.
     let (ka_tx, mut ka_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let ka_task = tokio::spawn(async move {
         // B31: RFC 1928 — the association is tied to the TCP control
         // connection's lifetime (EOF), not to stray bytes arriving on
         // it.  Loop until EOF or error.
@@ -1084,6 +1083,10 @@ async fn handle_udp_client(
     time_wait.insert(conn_id, Instant::now());
     conns.remove_if(&conn_id, |_, v| Arc::ptr_eq(v, &vconn));
     pool.send(Frame::rst(conn_id));
+    // B44: if the relay ended first (heartbeat sweep / RST), the keepalive
+    // watcher would otherwise keep the control TCP stream open until the
+    // client closes it — abort it so the task and socket are reclaimed.
+    ka_task.abort();
     Ok(())
 }
 

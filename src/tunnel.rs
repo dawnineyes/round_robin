@@ -54,6 +54,11 @@ fn ewma_rate(prev: f64, inst: f64, dt_secs: f64) -> f64 {
 pub struct TunnelPool {
     links: Mutex<Vec<Arc<TunnelLink>>>,
     rr: AtomicUsize,
+    /// Fires when a link is added: `send_async` waits on this when no
+    /// live link exists instead of failing instantly (B45 — a reconnect
+    /// usually lands within seconds; the caller's DATA_SEND_TIMEOUT
+    /// bounds the wait).
+    added: Notify,
 }
 
 impl TunnelPool {
@@ -61,11 +66,14 @@ impl TunnelPool {
         Self {
             links: Mutex::new(Vec::new()),
             rr: AtomicUsize::new(0),
+            added: Notify::new(),
         }
     }
 
     pub fn add(&self, link: Arc<TunnelLink>) {
         self.links.lock().unwrap().push(link);
+        // Wake every send_async waiter blocked on "no live link".
+        self.added.notify_waiters();
     }
 
     pub fn link_count(&self) -> usize {
@@ -190,7 +198,15 @@ impl TunnelPool {
                             link.alive.store(false, Ordering::Release);
                             full.retain(|l| !Arc::ptr_eq(l, &link));
                         }
-                        None => return false,
+                        None => {
+                            // B45: no live link at all right now — wait for
+                            // one to be added (tunnel reconnect) instead of
+                            // failing instantly, which truncated every
+                            // active connection's transfer on a short total
+                            // outage.  Callers wrap this in DATA_SEND_TIMEOUT
+                            // (30s), so the wait stays bounded.
+                            self.added.notified().await;
+                        }
                     }
                 }
             }
@@ -338,7 +354,15 @@ mod tests {
     #[tokio::test]
     async fn send_async_without_links_fails() {
         let pool = TunnelPool::new();
-        assert!(!pool.send_async(Frame::rst(1)).await);
+        // B45: no live link → wait for a link to be added, bounded by the
+        // caller's timeout (as in production, DATA_SEND_TIMEOUT).
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool.send_async(Frame::rst(1)),
+        )
+        .await
+        .unwrap_or(false);
+        assert!(!ok);
     }
 
     #[tokio::test]
@@ -386,7 +410,40 @@ mod tests {
         });
         pool.add(link);
         drop(rx); // receiver gone → channel closed
-        assert!(!pool.send_async(Frame::rst(1)).await);
+        // B45: the dead link is marked down on first try_send; with no
+        // live link left the send waits for a reconnect — the caller's
+        // timeout is what makes it fail.
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool.send_async(Frame::rst(1)),
+        )
+        .await
+        .unwrap_or(false);
+        assert!(!ok);
+    }
+
+    /// B45 regression: with no live link, send_async must WAIT for a
+    /// reconnect instead of failing instantly — a short total outage
+    /// (all tunnels reconnecting) used to truncate every active
+    /// connection's transfer.
+    #[tokio::test]
+    async fn send_async_waits_for_new_link() {
+        let pool = Arc::new(TunnelPool::new());
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+        let link = mk_link(tx, 0.0);
+        let pool2 = pool.clone();
+        let task = tokio::spawn(async move { pool2.send_async(Frame::rst(7)).await });
+        // No link yet — the send must NOT have returned after 100ms.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "send must wait while no link is live");
+        // A reconnect lands — the send must complete promptly.
+        pool.add(link);
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("send did not complete after a link was added")
+            .unwrap();
+        assert!(sent);
+        assert_eq!(rx.recv().await.unwrap().conn_id, 7);
     }
 
     // B22/B24 regression: stop must make drain_frames exit promptly and

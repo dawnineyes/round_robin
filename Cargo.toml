@@ -1,6 +1,6 @@
 [package]
 name = "round_robin"
-version = "1.10.9"
+version = "1.10.10"
 edition = "2024"
 
 [[bin]]
