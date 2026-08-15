@@ -6,6 +6,31 @@
 
 ---
 
+## Phase 21: splitter 就绪判定改用存活隧道数（v1.10.16）
+
+> **基线**: v1.10.15
+> **来源**: splitter 启动时用 `link_count()` 等待首个隧道，上一轮运行遗留的 stale/dead 链路会被计入，导致 splitter 在 reassembler 实际不可达时提前宣告 ready。
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/splitter.rs` | 就绪等待与 ready 日志改用 `alive_count()`（活隧道数）替代 `link_count()`（含死链路） | B60 |
+| `Cargo.toml` | 版本 1.10.15 → 1.10.16 | 发布 |
+
+### 行为变化
+
+- **B60 修复**: 只有至少一条**存活**隧道时才宣告 splitter ready；死链路不再造成提前就绪
+
+### 测试结果
+
+- `cargo test`: 通过
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
 ## Phase 20: 链路空闲清扫方向盲区修复（v1.10.15）
 
 > **基线**: v1.10.14

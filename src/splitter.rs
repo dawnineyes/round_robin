@@ -289,16 +289,19 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
     // ECONNREFUSED while tunnels are still connecting (CI e2e race).
     let listener = TcpListener::bind(cfg.listen_addr).await?;
 
-    // Wait for at least one tunnel. BUG-9: honor shutdown while waiting —
-    // a bad proxy config used to make Ctrl+C impossible to exit.
-    while pool.link_count() == 0 {
+    // Wait for at least one LIVE tunnel. BUG-9: honor shutdown while
+    // waiting — a bad proxy config used to make Ctrl+C impossible to exit.
+    // Use alive_count instead of link_count so stale/dead links left by a
+    // previous splitter run do not make us announce ready before the
+    // reassembler is actually reachable.
+    while pool.alive_count() == 0 {
         if shutdown.load(Ordering::Acquire) {
             info!("shutting down before first tunnel connected");
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    info!(listen = %cfg.listen_addr, tunnels = pool.link_count(), "splitter ready");
+    info!(listen = %cfg.listen_addr, tunnels = pool.alive_count(), "splitter ready");
 
     // UDP datagram counters (shared with heartbeat and UDP relay)
     let udp_sent = Arc::new(AtomicU64::new(0));
