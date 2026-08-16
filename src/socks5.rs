@@ -27,7 +27,14 @@ pub const REPLY_GENERAL_FAILURE: [u8; 10] =
 /// Result of a SOCKS5 server-side handshake.
 pub enum Socks5Result {
     Connect(Socks5Accept),
-    UdpAssociate { stream: TcpStream, relay: UdpSocket },
+    UdpAssociate {
+        stream: TcpStream,
+        relay: UdpSocket,
+        /// RFC 1928 UDP ASSOCIATE client address.  `None` means the client
+        /// used an unspecified address (0.0.0.0:0 / [::]:0), so the first
+        /// datagram sender is accepted.
+        client_addr: Option<SocketAddr>,
+    },
 }
 
 /// Result of a SOCKS5 CONNECT: the target the client wants and the stream.
@@ -107,8 +114,15 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<(Socks5Result
             // tunnel can carry the association's SYN, so the caller writes
             // success only after the SYN is queued.
             let rep = encode_reply(REP_SUCCESS, relay_addr);
-            let _ = client_addr; // ponytail: client_addr unused for single-client setup
-            Ok((Socks5Result::UdpAssociate { stream, relay }, rep))
+            let client_addr = udp_associate_client_addr(&client_addr);
+            Ok((
+                Socks5Result::UdpAssociate {
+                    stream,
+                    relay,
+                    client_addr,
+                },
+                rep,
+            ))
         }
         other => {
             let rep = [
@@ -126,6 +140,19 @@ pub async fn socks5_server_accept(mut stream: TcpStream) -> Result<(Socks5Result
             stream.write_all(&rep).await?;
             bail!("unsupported CMD={other}, only CONNECT/UDP_ASSOCIATE supported");
         }
+    }
+}
+
+/// Convert a UDP ASSOCIATE client address into a pinned relay source.
+/// RFC 1928 clients usually send 0.0.0.0:0 (or [::]:0) to let the server
+/// choose; only a concrete IP/port is safe to pin before the first packet.
+fn udp_associate_client_addr(addr: &TargetAddr) -> Option<SocketAddr> {
+    if addr.port == 0 {
+        return None;
+    }
+    match addr.address.parse::<std::net::IpAddr>() {
+        Ok(ip) if !ip.is_unspecified() => Some(SocketAddr::new(ip, addr.port)),
+        _ => None,
     }
 }
 
@@ -397,5 +424,37 @@ mod tests {
         assert_eq!(decoded_target.address, "dns.google");
         assert_eq!(decoded_target.port, 53);
         assert_eq!(decoded_data.len(), 32);
+    }
+
+    #[test]
+    fn udp_associate_client_addr_pins_only_concrete_addresses() {
+        assert_eq!(
+            udp_associate_client_addr(&TargetAddr {
+                address: "192.0.2.1".into(),
+                port: 40000,
+            }),
+            Some("192.0.2.1:40000".parse().unwrap())
+        );
+        assert_eq!(
+            udp_associate_client_addr(&TargetAddr {
+                address: "0.0.0.0".into(),
+                port: 0,
+            }),
+            None
+        );
+        assert_eq!(
+            udp_associate_client_addr(&TargetAddr {
+                address: "::".into(),
+                port: 0,
+            }),
+            None
+        );
+        assert_eq!(
+            udp_associate_client_addr(&TargetAddr {
+                address: "dns.google".into(),
+                port: 53,
+            }),
+            None
+        );
     }
 }

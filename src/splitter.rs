@@ -350,6 +350,8 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                     warn!(conn_id = cid, "sweeping orphaned connection");
                     // B25: tombstone before removal so alloc_conn_id can't
                     // reuse the id while stale frames are in flight.
+                    vc.rst.store(true, Ordering::Release);
+                    hb_pool.send(Frame::rst(cid));
                     hb_time_wait.insert(cid, Instant::now());
                     return false;
                 }
@@ -380,8 +382,10 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                             );
                         }
                         vc.closed.store(true, Ordering::Release);
+                        vc.rst.store(true, Ordering::Release);
                         vc.notify.notify_one();
                         // B25: tombstone before removal.
+                        hb_pool.send(Frame::rst(cid));
                         hb_time_wait.insert(cid, Instant::now());
                         return false;
                     }
@@ -399,8 +403,10 @@ pub async fn run_splitter(cfg: SplitterConfig) -> Result<()> {
                 if idle > timeout {
                     warn!(conn_id = cid, idle_secs = idle, "connection idle timeout");
                     vc.closed.store(true, Ordering::Release);
+                    vc.rst.store(true, Ordering::Release);
                     vc.notify.notify_one();
                     // B25: tombstone before removal.
+                    hb_pool.send(Frame::rst(cid));
                     hb_time_wait.insert(cid, Instant::now());
                     return false;
                 }
@@ -598,6 +604,9 @@ fn handle_inbound_frame(
                 seq = frame.seq,
                 "late DATA frame on TIME_WAIT conn_id — possible data loss"
             );
+            // Tell the reassembler to stop sending for this conn_id instead
+            // of letting it keep pushing stale frames until its idle sweep.
+            pool.send(Frame::rst(frame.conn_id));
         } else {
             // Unknown conn_id: stale/dangling. Send RST so the
             // reassembler cleans up and stops flooding the tunnel.
@@ -687,8 +696,17 @@ async fn handle_client(stream: TcpStream, ctx: ClientCtx) -> Result<()> {
             }
         };
     ctx.half_open.fetch_sub(1, Ordering::AcqRel);
-    ctx.conn_slot.notify_one();
-    let (accepted, reply) = accepted?;
+    // B64: do NOT notify here — the connection is not in `conns` yet, so
+    // waking the accept loop now can make it admit one more connection
+    // and exceed MAX_CONCURRENT_CONNS.  Notify only on failure (the
+    // half-open slot is actually free) or after the handler ends.
+    let (accepted, reply) = match accepted {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.conn_slot.notify_one();
+            return Err(e);
+        }
+    };
     // B40: allocate the conn_id only after the handshake completes — an
     // id allocated earlier would sit unoccupied for up to HANDSHAKE_TIMEOUT
     // and a second accept could draw the same id, so the two conns would
@@ -712,7 +730,8 @@ async fn handle_client(stream: TcpStream, ctx: ClientCtx) -> Result<()> {
         socks5::Socks5Result::UdpAssociate {
             stream: keepalive,
             relay,
-        } => handle_udp_client(conn_id, relay, keepalive, reply, &ctx).await,
+            client_addr,
+        } => handle_udp_client(conn_id, relay, keepalive, reply, client_addr, &ctx).await,
     };
     ctx.conn_slot.notify_one();
     result
@@ -805,6 +824,9 @@ async fn handle_tcp_client(
 
     let mut seq: u64 = 1;
     let close_reason: &str;
+    // B61: a DATA frame that timed out is permanently lost (TCP tunnels
+    // never retransmit) — the connection must be reset, not FINned.
+    let mut force_rst = false;
     // O1: one reusable read buffer per connection; each frame copies
     // exactly n bytes into a fresh Bytes (no 64 KB backing per frame).
     let mut buf = vec![0u8; chunk_size];
@@ -828,6 +850,7 @@ async fn handle_tcp_client(
                         if !sent {
                             warn!(conn_id, "no live tunnels after timeout, aborting");
                             close_reason = "no_tunnel";
+                            force_rst = true;
                             break;
                         }
                         vconn.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
@@ -861,15 +884,18 @@ async fn handle_tcp_client(
 
     // FIN carries next_seq so the reassembler can half-close its egress
     // write side exactly when every in-flight frame has been delivered.
-    // On RST the peer is already tearing down — no FIN needed.
-    let fin_sent = if close_reason == "rst" {
+    // On RST the peer is already tearing down — no FIN needed.  On B61
+    // `force_rst`, a DATA frame was lost, so FIN would silently truncate.
+    let fin_sent = if close_reason == "rst" || force_rst {
         false
     } else {
         tokio::time::timeout(data_send_timeout, pool.send_async(Frame::fin(conn_id, seq)))
             .await
             .unwrap_or(false)
     };
-    if !fin_sent && close_reason != "rst" {
+    if force_rst {
+        pool.send(Frame::rst(conn_id));
+    } else if !fin_sent && close_reason != "rst" {
         // BUG-11: without a FIN the reassembler's egress would linger for
         // up to the 300s idle sweep — send a best-effort RST instead so
         // it tears down promptly.
@@ -885,7 +911,7 @@ async fn handle_tcp_client(
     // If no FIN arrives at all, keep the conn alive while responses keep
     // flowing and tear down after CLOSE_QUIET_TIMEOUT of silence.
     // grace_waiting tells the heartbeat to keep its hands off (D3).
-    if close_reason == "eof" {
+    if close_reason == "eof" && fin_sent {
         vconn.grace_waiting.store(true, Ordering::Release);
         let mut fin_seen_at: Option<Instant> = None;
         loop {
@@ -954,6 +980,7 @@ async fn handle_udp_client(
     relay: UdpSocket,
     keepalive: TcpStream,
     reply: Vec<u8>,
+    client_addr: Option<SocketAddr>,
     ctx: &ClientCtx,
 ) -> Result<()> {
     // Bundled context (see handle_tcp_client).
@@ -1013,7 +1040,9 @@ async fn handle_udp_client(
     send_socks5_reply(&mut ka, &reply).await;
 
     // Track SOCKS5 client address so we can send_to (socket is unconnected).
-    let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    // If the UDP ASSOCIATE request specified a concrete client address, pin
+    // it before the first datagram; otherwise the first sender is accepted.
+    let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(client_addr));
 
     let relay2 = relay.clone();
     let ca = client_addr.clone();

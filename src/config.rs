@@ -125,6 +125,12 @@ impl SplitterConfig {
             self.reorder_window_bytes,
             self.chunk_size as u64,
         )?;
+        if self.tunnel.iter().any(|t| t.port == 0) {
+            bail!("splitter.tunnel port must not be 0");
+        }
+        if self.tunnel.iter().any(|t| t.proxy.port() == 0) {
+            bail!("splitter.tunnel proxy port must not be 0");
+        }
         Ok(())
     }
 }
@@ -254,6 +260,11 @@ pub fn parse_ports(ports: &Ports) -> Result<Vec<u16>> {
     if out.len() > MAX_PORTS {
         bail!("port list has {} entries, max {MAX_PORTS}", out.len());
     }
+    // Port 0 has no valid listener meaning here: a reassembler would bind a
+    // random port while the splitter still tries to connect to port 0.
+    if out.contains(&0) {
+        bail!("port 0 is not allowed in reassembler.ports");
+    }
     // BUG-14: duplicate ports make the second listener fail its bind and
     // silently die — dedup and warn instead of half-working configs.
     let mut seen = std::collections::HashSet::new();
@@ -326,6 +337,13 @@ mod tests {
         assert!(parse_ports(&ports).is_err());
     }
 
+    #[test]
+    fn parse_ports_rejects_zero() {
+        assert!(parse_ports(&Ports::List(vec![0])).is_err());
+        assert!(parse_ports(&Ports::Range("0-10".into())).is_err());
+        assert!(parse_ports(&Ports::Range("52310".into())).is_ok());
+    }
+
     /// B55: zero timeouts must be rejected at startup — a 0 heartbeat
     /// interval spins the sweep task at 100% CPU, a 0 send timeout makes
     /// every DATA/FIN send time out instantly (connection cascade).
@@ -365,6 +383,23 @@ tunnel = []
         )
         .unwrap();
         cfg.splitter.unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_tunnel_port_zero() {
+        let cfg: Config = toml::from_str(
+            r#"
+mode = "splitter"
+
+[splitter]
+[[splitter.tunnel]]
+proxy = "127.0.0.1:1080"
+target = "127.0.0.1"
+port = 0
+"#,
+        )
+        .unwrap();
+        assert!(cfg.splitter.unwrap().validate().is_err());
     }
 
     /// B58: the reorder window defaults to 64 MB and must at least hold

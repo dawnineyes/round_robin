@@ -218,8 +218,9 @@ impl TunnelPool {
     /// weight is the EWMA of its drain throughput (`rate_bps`), floored at
     /// a minimum share so no live tunnel starves.  A full queue means the
     /// link is already saturated — skip it and re-pick instead of blocking
-    /// (a slow tunnel never stalls a frame another tunnel can take); only
-    /// when every live link is full do we block on the best one.
+    /// (a slow tunnel never stalls a frame another tunnel can take); when
+    /// every live link is full we wait briefly and retry from scratch so a
+    /// link that frees up is considered immediately.
     pub async fn send_async(&self, frame: Frame) -> bool {
         let mut full: Vec<Arc<TunnelLink>> = Vec::new();
         loop {
@@ -243,9 +244,7 @@ impl TunnelPool {
                     }
                 },
                 None => {
-                    // No live link, or every live link is saturated —
-                    // block on the highest-weight one (real backpressure,
-                    // bounded by callers' DATA_SEND_TIMEOUT).
+                    // No live link, or every live link is saturated.
                     let best = {
                         let links = self.links.lock().unwrap();
                         links
@@ -259,12 +258,14 @@ impl TunnelPool {
                             .cloned()
                     };
                     match best {
-                        Some(link) => {
-                            if link.tx.send(frame.clone()).await.is_ok() {
-                                return true;
-                            }
-                            link.alive.store(false, Ordering::Release);
-                            full.retain(|l| !Arc::ptr_eq(l, &link));
+                        Some(_) => {
+                            // B65: all live links are full.  Do not block on
+                            // one specific `best` link — it may stay full
+                            // while another link frees up.  Clear the `full`
+                            // set so recovered links are reconsidered, and
+                            // wait briefly before retrying.
+                            full.clear();
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }
                         None => {
                             // B45: no live link at all right now — wait for
@@ -574,6 +575,43 @@ mod tests {
             .unwrap();
         assert!(sent);
         assert_eq!(rx.recv().await.unwrap().conn_id, 7);
+    }
+
+    /// B65 regression: when every link is full, freeing any link must let
+    /// send_async complete; it must not stay blocked on one `best` link
+    /// while another link has become writable.
+    #[tokio::test]
+    async fn send_async_retries_recovered_link_when_all_full() {
+        let pool = Arc::new(TunnelPool::new());
+        let (tx_a, rx_a) = mpsc::channel::<Frame>(1);
+        let (tx_b, mut rx_b) = mpsc::channel::<Frame>(1);
+        let a = mk_link(tx_a, 0.0);
+        let b = mk_link(tx_b, 0.0);
+        pool.add(a.clone());
+        pool.add(b.clone());
+
+        // Fill both queues so the first send_async pass sees all full.
+        assert!(a.tx.try_send(Frame::rst(1)).is_ok());
+        assert!(b.tx.try_send(Frame::rst(2)).is_ok());
+
+        let pool2 = pool.clone();
+        let task = tokio::spawn(async move { pool2.send_async(Frame::rst(7)).await });
+        // Let send_async observe that both links are saturated.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Free only link B.  The send must use it instead of blocking on A.
+        assert_eq!(rx_b.recv().await.unwrap().conn_id, 2);
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("send_async did not use the recovered link")
+            .unwrap();
+        assert!(sent);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+            .await
+            .expect("frame was not delivered on the recovered link")
+            .unwrap();
+        assert_eq!(got.conn_id, 7);
+        drop(rx_a);
     }
 
     // B22/B24 regression: stop must make drain_frames exit promptly and

@@ -6,6 +6,42 @@
 
 ---
 
+## Phase 22: 第十轮代码审查修复（v1.10.17）
+
+> **基线**: v1.10.16
+> **来源**: 快速代码审查（BUG_REVIEW_v11016 遗留 + 本轮新增静态走查项）
+
+### 修改文件
+
+| 文件 | 修改内容 | 原因 |
+|------|----------|------|
+| `src/splitter.rs` | DATA 发送超时改为强制 RST，不再发 FIN；heartbeat 清扫连接时通知 reassembler；EOF 且 FIN 发送失败时跳过 grace；TIME_WAIT 迟到 DATA 回 RST；修复握手成功后过早唤醒 accept 循环 | B61/B64/新增清理与等待问题 |
+| `src/reassembler.rs` | SYN 排空 pending 时 egress 写失败/reorder overflow 立即 reset；heartbeat idle 清扫向 splitter 发 RST | B62/B63 |
+| `src/tunnel.rs` | `send_async` 全链路满时清空 `full` 并短暂重试，避免永久阻塞在单条已满链路上 | B65 |
+| `src/socks5.rs` | UDP ASSOCIATE 携带并固定客户端声明的具体地址，非零地址不再被首个发包者劫持 | 安全加固 |
+| `src/config.rs` | reassembler.ports 与 splitter.tunnel 拒绝端口 0 | 配置校验 |
+| `Cargo.toml` | 版本 1.10.16 → 1.10.17 | 发布 |
+
+### 行为变化
+
+- **B61 修复**: splitter 上行 DATA 因无隧道超时后直接 RST，不再用 FIN 造成静默截断
+- **B62 修复**: reassembler 在 SYN 握手期间回放 DATA 时遇到 egress 写失败或 reorder overflow 会 reset 连接
+- **B63 修复**: reassembler idle 清扫会向 splitter 发 RST，对端不再等自己的 idle 超时
+- **B64 修复**: splitter 握手成功到 conn 插入之间的窗口不再提前唤醒 accept 循环，连接数上限语义恢复
+- **B65 修复**: 所有隧道队列满时，任意隧道腾出空间后 `send_async` 能立即使用，不再卡在单个 `best` 链路
+- **新增清理修复**: splitter heartbeat 清扫孤儿/idle/FIN 完成连接时发送 RST；EOF 且 FIN 发送失败时不再空等 60s grace
+- **安全/配置**: UDP ASSOCIATE 支持固定客户端地址；端口 0 被配置校验拒绝
+
+### 测试结果
+
+- `cargo test`: 63 单元测试 + 5 e2e 集成测试通过
+- `cargo clippy --all-targets -- -D warnings`: 0
+- `cargo fmt`: 通过
+- `cargo build --all-targets`: 通过
+
+---
+
+
 ## Phase 21: splitter 就绪判定改用存活隧道数（v1.10.16）
 
 > **基线**: v1.10.15

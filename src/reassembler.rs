@@ -279,6 +279,9 @@ pub async fn run_reassembler(cfg: ReassemblerConfig) -> Result<()> {
                     warn!(conn_id = cid, idle_secs = idle, "connection idle timeout");
                     hb_closed.insert(cid, Instant::now());
                     signal_teardown(vc);
+                    // B63: tell the splitter this conn is gone; otherwise it
+                    // keeps the entry until its own idle sweep.
+                    hb_pool.send(Frame::rst(cid));
                     return false;
                 }
                 true
@@ -959,6 +962,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 return Ok(());
             }
             let mut fin_seq: Option<u64> = None;
+            let mut reset = false;
             for f in entry.frames {
                 if f.flags & FLAG_DATA != 0 {
                     // Hold the reorder lock across push + egress writes —
@@ -968,6 +972,20 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     let result = reorder.push(f.seq, f.payload);
                     // Pending frames are replayed — stats already counted when
                     // originally queued, so don't double-count here.
+                    if !result.accepted {
+                        let overflow = result.overflow;
+                        drop(reorder);
+                        if overflow {
+                            warn!(
+                                conn_id = cid,
+                                seq = f.seq,
+                                "reorder overflow during SYN drain, resetting connection"
+                            );
+                            reset = true;
+                            break;
+                        }
+                        continue;
+                    }
                     let mut write_failed = false;
                     for chunk in result.ready {
                         if !vconn.egress().write(chunk) {
@@ -978,6 +996,7 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                     }
                     drop(reorder);
                     if write_failed {
+                        reset = true;
                         break;
                     }
                     if vconn.fin_received.load(Ordering::Acquire) {
@@ -986,6 +1005,21 @@ async fn handle_frame(frame: Frame, ctx: &ReadLoopCtx) -> Result<()> {
                 } else if f.flags & FLAG_FIN != 0 {
                     fin_seq = Some(f.seq);
                 }
+            }
+            if reset {
+                // B62: a failed egress write or reorder overflow during SYN
+                // replay means the stream is permanently broken — reset both
+                // sides instead of half-closing with missing data.
+                warn!(conn_id = cid, "SYN drain failed, resetting connection");
+                if let Some((_, vc)) = ctx.conns.remove(&cid) {
+                    signal_teardown(&vc);
+                    drop(vc);
+                }
+                ctx.closed.insert(cid, Instant::now());
+                ctx.pool.send(Frame::rst(cid));
+                ctx.resets.fetch_add(1, Ordering::Relaxed);
+                ctx.handshaking.remove(&cid);
+                return Ok(());
             }
             if let Some(seq) = fin_seq {
                 info!(conn_id = cid, "FIN during SYN, half-closing");
